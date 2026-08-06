@@ -1,0 +1,49 @@
+# ============================================================
+# 供应商预设
+# 代码会自动读取这个文件，你不需要在 .env 里填 base_url
+# 只需要在 .env 里写 LLM_PROVIDER=xxx 和 LLM_MODEL=xxx
+# ============================================================
+
+[anthropic]
+protocol = "anthropic"
+models = ["claude-sonnet-4-20250514", "claude-haiku-3-5-20251022", "claude-opus-4-20250514"]
+
+[openai]
+protocol = "openai"
+base_url = "https://api.openai.com/v1"
+models = ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "o4-mini"]
+
+[deepseek]
+protocol = "openai"
+base_url = "https://api.deepseek.com/v1"
+models = ["deepseek-v4-flash", "deepseek-reasoner"]
+
+[zhipu]
+protocol = "openai"
+base_url = "https://open.bigmodel.cn/api/paas/v4/"
+models = ["glm-4-flash", "glm-4-plus", "glm-4-air"]
+
+[dashscope]
+protocol = "openai"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+models = ["qwen-max", "qwen-plus", "qwen-turbo", "qwen3-omni-flash"]
+
+[ollama]
+protocol = "openai"
+base_url = "http://localhost:11434/v1"
+models = ["qwen2.5", "llama3.2", "deepseek-r1"]
+
+[siliconflow]
+protocol = "openai"
+base_url = "https://api.siliconflow.cn/v1"
+models = ["Qwen/Qwen2.5-7B-Instruct", "deepseek-ai/DeepSeek-V3"]
+
+[groq]
+protocol = "openai"
+base_url = "https://api.groq.com/openai/v1"
+models = ["llama-3.1-70b-versatile", "mixtral-8x7b-32768"]
+
+# 自定义：不查表，直接读 .env 里的 LLM_BASE_URL
+[custom]
+protocol = "openai"
+# 没有预设 URL，需要用户在 .env 里自己填 LLM_BASE_URL
