@@ -8,11 +8,9 @@ ReAct Agent 交互式运行入口
 
 import os
 import sys
-from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 
-load_dotenv()
-
+# 环境变量由 config.py 在导入 test2.graph 时从项目根目录统一加载
 from test2.graph import build_graph, MAX_ITERATIONS
 
 

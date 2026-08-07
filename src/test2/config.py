@@ -13,8 +13,11 @@ import tomllib
 from pathlib import Path
 from dotenv import load_dotenv
 
-# 显式加载与 config.py 同级的 .env，避免依赖运行时 cwd（无论从哪个目录启动都能读到配置）
-load_dotenv(Path(__file__).parent / ".env")
+# 项目根目录 = config.py 所在 src/test2/ 向上两级
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# 统一从项目根目录加载 .env，避免依赖运行时 cwd（无论从哪个目录启动都能读到配置）
+load_dotenv(PROJECT_ROOT / ".env")
 #将.env中的环境变量加载到os.environ中(字典格式)
 
 # 加载预设表

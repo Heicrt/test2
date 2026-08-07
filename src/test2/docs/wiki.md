@@ -113,6 +113,8 @@ Agent 内部发生的事：
 ```
 test2/
 ├── README.md           使用说明
+├── .env                环境变量（不提交Git）
+├── .env.example        环境变量模板
 ├── wiki.md             本文件（逐行解析）
 ├── pyproject.toml      Python 项目配置
 └── src/test2/
@@ -121,8 +123,6 @@ test2/
     ├── providers.toml  供应商预设表（核心改进）            [50 行]
     ├── graph.py        LangGraph 图定义                   [192 行]
     ├── tools.py        工具定义（含和风天气 API）          [97 行]
-    ├── .env            环境变量
-    └── .env.example    环境变量模板
 ```
 
 ---

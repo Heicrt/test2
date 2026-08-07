@@ -19,7 +19,7 @@
   - 2.1 三角色分工
   - 2.2 一条消息的完整旅程（先看全局）
 - **三、FastAPI 服务骨架**
-  - 3.1 导入与 `.env` 显式加载
+  - 3.1 导入与 `.env` 统一加载
   - 3.2 `get_agent()` — Agent 懒加载
   - 3.3 路由 `/` — 返回页面
   - 3.4 路由 `/api/chat` — 处理对话
@@ -178,41 +178,41 @@ flowchart LR
 
 `web.py` 顶部到路由定义之间的部分，负责把服务"支棱起来"。
 
-### 3.1 导入与 `.env` 显式加载
+### 3.1 导入与 `.env` 统一加载
 
 ```python
 import json
 import os
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import HumanMessage
 
-# 显式加载与 web.py 同级的 .env，保证 uvicorn 从任意目录启动都能读到配置
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
-
+# 环境变量由 config.py 在导入 test2.graph 时从项目根目录统一加载
 from test2.graph import build_graph, MAX_ITERATIONS
 ```
 
-关键点是** `.env` 的显式加载路径**：
+关键点：**`.env` 不再由 web.py 自己加载**。
+
+`web.py` 导入 `test2.graph` 时，会先执行 `test2.config`；`config.py` 使用 `__file__` 定位项目根目录：
 
 ```python
-os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(PROJECT_ROOT / ".env")
 ```
 
-__file__：Python 内置变量，代表当前这一份 web.py 文件本身；
-os.path.abspath(__file__)：拿到 web.py 在电脑里完整绝对路径（比如D:/project/test2/web.py）；
-os.path.dirname(路径)：截取路径的文件夹部分，去掉文件名；
+其中：
 
-这行拿到 `web.py` 所在目录（`src/test2/`），再拼上 `.env`。
+- `config.py` 位于 `src/test2/`
+- `parents[0]` 是 `src/test2`
+- `parents[1]` 是 `src`
+- `parents[2]` 就是项目根目录
 
-**为什么不能直接 `load_dotenv()`？**
+所以即使 uvicorn 从其他目录启动，`.env` 也会从项目根目录加载，不依赖运行时 cwd。
 
-CLI 入口 `__main__.py` 可以裸写 `load_dotenv()`，因为 `python -m test2` 会以项目根为工作目录。但 **uvicorn 的工作目录由启动命令决定，可能不是项目根**（比如你在别处敲 `uvicorn`）。如果工作目录不对，`load_dotenv()` 就找不到 `.env`，API Key 就读不到。
+CLI 入口同样不再重复调用 `load_dotenv()`，统一由 `config.py` 负责环境变量加载。
 
-所以 Web 入口必须**用 `__file__` 拼出绝对路径**，锁死 `.env` 的位置，让"从哪个目录启动"变得无关紧要。
 
 ### 3.2 `get_agent()` — Agent 懒加载
 
@@ -301,7 +301,7 @@ if os.path.isdir(STATIC_DIR):
 
 | 设计 | 解决的问题 |
 |---|---|
-| `.env` 显式绝对路径加载 | uvicorn 工作目录不确定，导致找不到配置 |
+| `.env` 由 config.py 从项目根目录统一加载 | uvicorn 工作目录不确定，也能稳定找到配置 |
 | Agent 懒加载 | Key 没配好服务也能启动，把错误推迟到请求时 |
 | `encoding="utf-8"` 读 HTML | 避免中文页面乱码 |
 | 空消息拦截 | 减少无意义的 Agent 调用 |

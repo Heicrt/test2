@@ -21,6 +21,7 @@ from test2.tools import TOOLS, TOOL_MAP
 # 1. State（状态）定义
 #    在所有节点之间传递的数据结构
 #    MessagesState = 官方消息列表 + add_messages 合并器
+#   MessagesState 中只有包含 messages 字段 ，以及Annotated[list[AnyMessage], add_messages]
 # ============================================================
 
 class ReActState(MessagesState):

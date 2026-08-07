@@ -15,15 +15,12 @@ FastAPI + SSE 前端可视化入口（对话交互界面）
 import json
 import os
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import HumanMessage
 
-# 显式加载与 web.py 同级的 .env，保证 uvicorn 从任意目录启动都能读到配置
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
-
+# 环境变量由 config.py 在导入 test2.graph 时从项目根目录统一加载
 from test2.graph import build_graph, MAX_ITERATIONS
 
 # 本文件所在目录（static 与此同级）

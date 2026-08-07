@@ -28,13 +28,13 @@ pip install -e .
 1. 复制环境变量模板：
 
 ```bash
-cp src/test2/.env.example src/test2/.env
+cp .env.example .env
 ```
 
-> **注意**：`.env` 放在 `src/test2/`（与 `config.py` 同级），程序会**自动从该目录加载**，
+> **注意**：`.env` 放在项目根目录，`config.py` 会**自动从项目根目录加载**，
 > 与启动时的当前工作目录（cwd）无关。任意位置用 `uv run` 启动都能读到配置。
 
-2. 编辑 `src/test2/.env`，填入你的 API Key：
+2. 编辑 `.env`，填入你的 API Key：
 
 ```env
 LLM_PROVIDER=openai
@@ -68,7 +68,7 @@ uv run python -m test2 --app-dir src --provider deepseek
 ```
 
 > **兼容**：也可在 `src/` 目录内执行 `uv run python -m test2`（src 布局下更贴近包路径）。
-> 无论哪种方式，`.env` 都从 `src/test2/` 固定加载，不会因目录不同而丢失配置。
+> 无论哪种方式，`.env` 都从项目根目录固定加载，不会因目录不同而丢失配置。
 
 
 ## Web 可视化（对话交互界面）
@@ -146,6 +146,8 @@ uv run python -m uvicorn test2.web:app --reload --app-dir src
 
 ```
 test2/
+├── .env                    # 环境变量（不提交Git）
+├── .env.example            # 环境变量模板
 ├── README.md
 ├── wiki.md                  # 逐行解析文档
 ├── pyproject.toml
@@ -158,6 +160,4 @@ test2/
     ├── tools.py             # 工具定义
     ├── static/
     │   └── index.html       # Web 前端（对话交互界面）
-    ├── .env                 # 环境变量（不提交Git）
-    └── .env.example         # 环境变量模板
 ```
