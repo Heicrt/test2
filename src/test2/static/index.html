@@ -156,6 +156,7 @@
   <footer>
     <div id="input-bar">
       <input id="msg-input" placeholder="输入问题，回车发送…" autofocus>
+      <button id="clear-btn">清空</button>
       <button id="send-btn">发送</button>
     </div>
   </footer>
@@ -164,9 +165,20 @@
     const messagesEl = document.getElementById("messages");
     const input = document.getElementById("msg-input");
     const sendBtn = document.getElementById("send-btn");
+    const clearBtn = document.getElementById("clear-btn");
     const statusEl = document.getElementById("status");
 
     let running = false;
+
+    function getSessionId() {
+      let id = localStorage.getItem("test2_session_id");
+      if (!id) {
+        id = (crypto.randomUUID && crypto.randomUUID()) ||
+          "session-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+        localStorage.setItem("test2_session_id", id);
+      }
+      return id;
+    }
 
     function escapeHtml(s) {
       return String(s).replace(/[&<>"']/g, c =>
@@ -249,7 +261,7 @@
         const resp = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message }),
+          body: JSON.stringify({ message, session_id: getSessionId() }),
         });
 
         const reader = resp.body.getReader();
@@ -281,6 +293,21 @@
       }
     }
 
+    async function clearSession() {
+      if (running) return;
+      try {
+        await fetch("/api/clear", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: getSessionId() }),
+        });
+        messagesEl.innerHTML = "";
+        statusEl.textContent = "已清空";
+      } catch (e) {
+        bubble("❌ 清空失败：" + e.message, "assistant");
+      }
+    }
+
     function handleEvent(event, data, spans, getActiveIdx) {
       if (event === "node") {
         const map = { think: 0, act: 1, observe: 2 };
@@ -300,6 +327,7 @@
     }
 
     sendBtn.onclick = send;
+    clearBtn.onclick = clearSession;
     input.addEventListener("keydown", e => { if (e.key === "Enter") send(); });
   </script>
 </body>

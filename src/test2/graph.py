@@ -9,7 +9,10 @@ from langchain_core.messages import (
     HumanMessage,
     AIMessage,
     ToolMessage,
+    RemoveMessage,
+    trim_messages,
 )
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import MessagesState
 
@@ -45,16 +48,31 @@ def think_node(state: ReActState, llm_with_tools) -> dict:
     """
     Think 节点：AI 分析当前状态，决定下一步行动
 
-    输入: state["messages"]（完整对话历史）
+    输入: state["messages"]（最近窗口内的对话历史）
     输出: 更新 thought, should_act, tool_calls, messages
     """
-    response = llm_with_tools.invoke(state["messages"])
+    history = trim_messages(
+        state["messages"],
+        max_tokens=MEMORY_WINDOW,
+        token_counter=len,
+        strategy="last",
+        start_on="human",
+    )
+    response = llm_with_tools.invoke(history)
 
     # 判断 AI 是否请求了工具调用
     has_tool_calls = bool(response.tool_calls)
 
+    # 超出窗口的旧消息从 checkpoint 中移除
+    kept_ids = {msg.id for msg in history if msg.id is not None}
+    removals = [
+        RemoveMessage(id=msg.id)
+        for msg in state["messages"]
+        if msg.id is not None and msg.id not in kept_ids
+    ]
+
     return {
-        "messages": [response],  # AI 回复追加到历史
+        "messages": removals + [response],  # 裁剪旧历史 + AI 回复追加到历史
         "thought": response.content or "(AI 请求调用工具)",
         "should_act": has_tool_calls,
         "tool_calls": response.tool_calls or [],
@@ -126,6 +144,14 @@ def should_continue(state: ReActState) -> str:
 # ============================================================
 
 MAX_ITERATIONS = 35  # 最大循环次数（防止无限循环）
+MEMORY_WINDOW = 20  # 送入 LLM 的最近消息条数
+
+_checkpointer = InMemorySaver()
+
+
+def get_checkpointer():
+    """返回当前进程共享的内存 checkpointer。"""
+    return _checkpointer
 
 
 def build_graph(provider: str = "anthropic"):
@@ -170,5 +196,5 @@ def build_graph(provider: str = "anthropic"):
     graph.add_edge("observe", "think")
 
     # 编译图
-    app = graph.compile()
+    app = graph.compile(checkpointer=_checkpointer)
     return app

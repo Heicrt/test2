@@ -11,7 +11,9 @@ import sys
 from langchain_core.messages import HumanMessage
 
 # 环境变量由 config.py 在导入 test2.graph 时从项目根目录统一加载
-from test2.graph import build_graph, MAX_ITERATIONS
+from test2.graph import build_graph, MAX_ITERATIONS, get_checkpointer
+
+THREAD_ID = "cli-default"
 
 
 def print_react_log(messages, iteration):
@@ -68,6 +70,7 @@ def main():
 
     print(f"✅ ReAct Agent 已就绪")
     print(f"   输入 quit 或 exit 退出")
+    print(f"   输入 clear 或 /clear 清空当前会话记忆")
     print(f"   切换供应商：改 .env 中的 LLM_PROVIDER 即可")
     print(f"   最大循环次数: {MAX_ITERATIONS}")
     print()
@@ -85,6 +88,10 @@ def main():
         if user_input.lower() in ("quit", "exit", "q"):
             print("👋 再见！")
             break
+        if user_input.lower() in ("clear", "/clear"):
+            get_checkpointer().delete_thread(THREAD_ID)
+            print("\n🧹 已清空当前会话记忆")
+            continue
 
         # 运行 Agent（stream 模式：逐步捕获 state 变化）
         try:
@@ -96,7 +103,10 @@ def main():
                     "tool_calls": [],
                     "iteration": 0,
                 },
-                config={"recursion_limit": MAX_ITERATIONS * 3},
+                config={
+                    "recursion_limit": MAX_ITERATIONS * 3,
+                    "configurable": {"thread_id": THREAD_ID},
+                },
                 stream_mode="updates",
             ))
         except Exception as e:

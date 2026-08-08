@@ -21,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import HumanMessage
 
 # 环境变量由 config.py 在导入 test2.graph 时从项目根目录统一加载
-from test2.graph import build_graph, MAX_ITERATIONS
+from test2.graph import build_graph, MAX_ITERATIONS, get_checkpointer
 
 # 本文件所在目录（static 与此同级）
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -87,6 +87,7 @@ async def index():
 async def chat(request: Request):
     body = await request.json()
     user_input = body.get("message", "").strip()
+    session_id = str(body.get("session_id") or "default").strip() or "default"
     if not user_input:
         return StreamingResponse(
             iter([sse("error", {"message": "消息不能为空"})]),
@@ -105,7 +106,10 @@ async def chat(request: Request):
                     "tool_calls": [],
                     "iteration": 0,
                 },
-                config={"recursion_limit": MAX_ITERATIONS * 3},
+                config={
+                    "recursion_limit": MAX_ITERATIONS * 3,
+                    "configurable": {"thread_id": session_id},
+                },
                 stream_mode="updates",
             )
             for step in steps:
@@ -127,6 +131,14 @@ async def chat(request: Request):
             yield sse("error", {"message": str(e)})
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.post("/api/clear")
+async def clear_session(request: Request):
+    body = await request.json()
+    session_id = str(body.get("session_id") or "default").strip() or "default"
+    get_checkpointer().delete_thread(session_id)
+    return {"ok": True}
 
 
 # 静态资源（如果存在 static 目录则挂载；index.html 由 / 直接返回）

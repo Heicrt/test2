@@ -1450,13 +1450,13 @@ AI 会自动发现新工具（因为 `bind_tools` 会传递所有工具的 schem
 
 ### 8.3 添加记忆功能
 
-LangGraph 内置了 checkpoint（状态持久化）：
+本项目当前使用 LangGraph `InMemorySaver` 实现同进程内的多轮对话记忆：
 
 ```python
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.memory import InMemorySaver
 
-memory = MemorySaver()
-app = graph.compile(checkpointer=memory)
+_checkpointer = InMemorySaver()
+app = graph.compile(checkpointer=_checkpointer)
 
 # 运行时传入 thread_id
 config = {"configurable": {"thread_id": "user-123"}}
@@ -1464,6 +1464,13 @@ result = app.invoke(initial_state, config=config)
 
 # 下一次调用同 thread_id，状态自动恢复（包括 messages 历史）
 ```
+
+当前项目中的具体落地方式：
+
+- CLI 使用固定 `thread_id = "cli-default"`，输入 `clear` 或 `/clear` 会调用 `delete_thread()` 清空记忆。
+- Web 使用浏览器保存在 `localStorage` 的 `session_id` 作为 `thread_id`，`/api/clear` 接口用于清空当前会话。
+- `think_node` 通过 `trim_messages` 只保留最近 `MEMORY_WINDOW`（默认 20）条消息，并用 `RemoveMessage` 裁剪 checkpoint 中的旧消息。
+- 内存记忆只保留在当前 Python 进程内，服务重启后清空。
 
 ### 8.4 添加循环反思
 
