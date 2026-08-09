@@ -1,18 +1,53 @@
-# V1 多轮对话记忆实现详解
+# test2 多轮对话记忆系统完整详解（V1 + V2）
 
-> 本文档对应 `test2` 当前已经落地的 V1 多轮记忆能力：LangGraph `InMemorySaver` + `thread_id` + 最近 20 条消息窗口。
+> 本文档以当前代码为准，详细解释 `test2` 的多轮对话记忆实现。
+>
+> 当前版本包含：
+>
+> - V1：`InMemorySaver` + `thread_id` + 最近消息窗口
+> - V2：token 感知的动态摘要压缩
 
-## 1. 目标
+---
 
-让 CLI 和 Web 在同一个“会话”内记住之前的对话内容，并在下一次提问时把这些历史消息作为上下文送给 LLM。同时通过有限窗口避免对话无限变长后 token 持续膨胀。
+## 1. 概述
 
-当前实现的特点：
+### 1.1 当前记忆能力
 
-- 同一 Python 进程内有效。
-- 同一 `thread_id` 下会恢复之前的 `messages` 状态。
-- 只把最近 `MEMORY_WINDOW = 20` 条消息送入 LLM。
-- 超出窗口的旧消息会被 `RemoveMessage` 从 checkpoint 中删除。
-- 服务重启后记忆清空，因为使用的是内存型 checkpointer。
+`test2` 当前可以做到：
+
+- CLI 连续提问时，后一次提问能引用前一次对话内容。
+- Web 使用同一个 `session_id` 时，后一次提问能引用前一次对话内容。
+- 同一个会话通过 `thread_id` 隔离，不同会话互不干扰。
+- 历史消息通过 `messages` channel 保存在 LangGraph checkpoint 中。
+- 当历史 token 超过 `SUMMARY_TOKEN_THRESHOLD` 时，早期对话会被 LLM 压缩成摘要。
+- 被摘要覆盖的旧消息会从 checkpoint 中删除，避免内存无限增长。
+- CLI 和 Web 都支持清空当前会话。
+
+### 1.2 一句话原理
+
+```text
+会话 = thread_id
+历史 = messages + add_messages
+存储 = InMemorySaver
+控制 = trim_messages + RemoveMessage
+压缩 = LLM 生成 summary + SystemMessage
+```
+
+### 1.3 涉及文件
+
+```text
+test2/
+├── src/test2/
+│   ├── memory.py        # token 估算、摘要、裁剪逻辑
+│   ├── graph.py         # State、think_node、build_graph
+│   ├── __main__.py      # CLI 入口
+│   ├── web.py           # FastAPI + SSE 入口
+│   └── static/
+│       └── index.html   # 前端 session_id 与清空按钮
+└── README.md
+```
+
+---
 
 ## 2. 总体架构
 
@@ -23,55 +58,141 @@ CLI / Web
 thread_id / session_id
    │
    ▼
-LangGraph compiled graph (checkpointer=InMemorySaver)
+LangGraph compiled graph
+   │
+   ├── checkpointer = InMemorySaver
    │
    ▼
 think_node
    │
-   ├── trim_messages 保留最近窗口
-   ├── llm_with_tools.invoke(history)
-   ├── 返回 RemoveMessage + AIMessage
+   ├── prepare_conversation()
+   │     ├── count_tokens_approximately()
+   │     ├── trim_messages()
+   │     ├── build_summary()
+   │     └── RemoveMessage()
+   │
+   ├── [SystemMessage(summary), *recent_history]
+   │
+   ├── llm_with_tools.invoke()
    │
    ▼
 act_node / observe_node
    │
    ▼
-checkpoint 保存当前 thread 的最新状态
+checkpoint 保存最新状态
 ```
 
-## 3. 核心概念
+---
 
-### 3.1 `ReActState` + `MessagesState` + `add_messages`
+## 3. 状态设计
+
+### 3.1 `ReActState`
 
 当前状态定义：
 
 ```python
+from typing import Annotated
+
+from langgraph.graph.message import MessagesState
+
+
+def keep_existing_summary(old_value: str, new_value: str) -> str:
+    """空字符串不覆盖已有摘要，避免每次调用初始状态清空 summary。"""
+    return new_value if new_value else old_value
+
+
 class ReActState(MessagesState):
+    summary: Annotated[str, keep_existing_summary]
     should_act: bool
     tool_calls: list
     iteration: int
 ```
 
-`MessagesState` 自带：
+字段说明：
+
+| 字段 | 类型 | 作用 |
+| --- | --- | --- |
+| `messages` | `list[AnyMessage]` | 完整或最近的对话消息历史 |
+| `summary` | `str` | 早期对话摘要 |
+| `should_act` | `bool` | 当前 think 是否请求了工具 |
+| `tool_calls` | `list` | 待执行的工具调用 |
+| `iteration` | `int` | 当前循环次数 |
+
+### 3.2 `MessagesState`
+
+`MessagesState` 是 LangGraph 官方预定义状态：
 
 ```python
-messages: Annotated[list[AnyMessage], add_messages]
+class MessagesState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
 ```
 
-`add_messages` 是消息列表的 reducer，负责把节点返回的消息合并到历史中。
+它只做一件事：提供带 `add_messages` reducer 的 `messages` 字段。
+
+### 3.3 `add_messages` 合并规则
+
+`add_messages` 是消息列表 reducer。节点不需要返回完整历史，只需要返回本轮变化。
 
 规则：
 
-- 无重复 `id` 的新消息：追加。
-- 相同 `id` 的新消息：替换旧消息。
-- `RemoveMessage`：删除指定 `id` 的消息。
-- 无 `id` 的消息：自动分配 `id`。
+```text
+1. 新消息 id 不存在 → 追加
+2. 新消息 id 已存在 → 替换
+3. RemoveMessage(id=...) → 删除对应消息
+4. 消息没有 id → add_messages 自动分配 id
+```
 
-这是整个多轮记忆的基础：**每个节点只需要返回本轮新增或删除的消息，不需要手动维护完整历史列表。**
+示例：
 
-### 3.2 `InMemorySaver` / `MemorySaver`
+```python
+from langgraph.graph.message import add_messages
 
-`InMemorySaver` 是 LangGraph 提供的内存型 checkpoint saver。
+old = [HumanMessage(content="你好", id="1")]
+new = [HumanMessage(content="修改后的你好", id="1")]
+
+add_messages(old, new)
+# → [HumanMessage(content="修改后的你好", id="1")]
+```
+
+### 3.4 `summary` reducer
+
+`summary` 不能使用普通覆盖语义，因为 CLI/Web 每次调用都会传入：
+
+```python
+{
+    "messages": [HumanMessage(content=user_input)],
+    "thought": "",
+    "summary": "",
+    "should_act": False,
+    "tool_calls": [],
+    "iteration": 0,
+}
+```
+
+如果 `summary` 是普通字段，每次传入空字符串都会把已有摘要覆盖为空。
+
+所以使用：
+
+```python
+def keep_existing_summary(old_value: str, new_value: str) -> str:
+    return new_value if new_value else old_value
+```
+
+效果：
+
+```text
+已有 summary = "用户叫小明"
+本次传入 summary = ""
+最终 summary = "用户叫小明"
+```
+
+---
+
+## 4. 核心框架能力
+
+### 4.1 `InMemorySaver`
+
+`InMemorySaver` 是 LangGraph 提供的内存型 checkpoint saver：
 
 ```python
 from langgraph.checkpoint.memory import InMemorySaver
@@ -81,19 +202,20 @@ _checkpointer = InMemorySaver()
 
 作用：
 
-- 按 `thread_id` 保存每个线程的 checkpoint。
-- 保存的是节点执行后的状态快照，包括 `messages` 等 channel。
-- 同一个 `thread_id` 再次调用图时，LangGraph 会先恢复之前的 checkpoint。
+- 按 `thread_id` 保存状态快照。
+- 保存 `messages`、`summary`、`should_act` 等 channel。
+- 同一个 `thread_id` 再次执行图时，先恢复历史 checkpoint。
 
 注意：
 
-- `MemorySaver` 是 `InMemorySaver` 的向后兼容别名。
-- 它只存在内存中，进程退出后丢失。
-- 生产环境通常改用 SQLite / Postgres 等持久化 checkpointer。
+- `MemorySaver` 是旧别名，新代码推荐 `InMemorySaver`。
+- 数据只存在于内存。
+- 服务重启后丢失。
+- 生产环境可替换为 SQLite / Postgres saver。
 
-### 3.3 `thread_id`
+### 4.2 `thread_id`
 
-`thread_id` 是 LangGraph checkpoint 的会话标识。
+`thread_id` 是 LangGraph checkpoint 的会话 ID：
 
 ```python
 config = {
@@ -103,175 +225,356 @@ config = {
 }
 ```
 
-同一个 `thread_id` 表示同一个会话；不同的 `thread_id` 之间状态隔离。
+本项目映射：
 
-本项目中的映射：
+| 入口 | 会话 ID |
+| --- | --- |
+| CLI | `cli-default` |
+| Web | `session_id` |
+| 前端 | `localStorage.test2_session_id` |
 
-- CLI：`thread_id = "cli-default"`
-- Web：`thread_id = session_id`
-- 前端：`session_id` 保存在 `localStorage`
+### 4.3 `trim_messages`
 
-### 3.4 `trim_messages`
-
-`trim_messages` 是 LangChain 提供的消息裁剪工具，位于 `langchain_core.messages`。
-
-当前用法：
+`trim_messages` 用来计算“这次应该给 LLM 看哪些消息”：
 
 ```python
-history = trim_messages(
-    state["messages"],
-    max_tokens=MEMORY_WINDOW,
+from langchain_core.messages import trim_messages
+
+recent_history = trim_messages(
+    messages,
+    max_tokens=20,
     token_counter=len,
     strategy="last",
     start_on="human",
 )
 ```
 
-关键参数：
+参数含义：
 
-| 参数 | 当前值 | 含义 |
+| 参数 | 当前值 | 作用 |
 | --- | --- | --- |
-| `max_tokens` | `MEMORY_WINDOW` | 最大保留单位数 |
-| `token_counter` | `len` | 用消息条数计数，而不是估算 token 数 |
-| `strategy` | `"last"` | 保留末尾消息，丢弃开头消息 |
-| `start_on` | `"human"` | 裁剪后从 HumanMessage 开始，避免从 ToolMessage 中间开始 |
+| `max_tokens` | `20` | 保留数量上限 |
+| `token_counter` | `len` | 按消息条数计数 |
+| `strategy` | `"last"` | 保留末尾消息 |
+| `start_on` | `"human"` | 从 HumanMessage 开始 |
 
-`token_counter` 可以替换为：
+`start_on="human"` 很重要：
 
-- `"approximate"`：快速近似 token 数。
-- LLM 实例：精确调用 `get_num_tokens_from_messages()`。
+- 避免裁剪后第一条是 `ToolMessage`。
+- 避免把 `AIMessage(tool_calls)` 和 `ToolMessage` 拆散。
 
-`trim_messages` 只负责生成“应该保留的历史”，**它本身不会从 LangGraph checkpoint 中删除旧消息**。
+注意：`trim_messages` 只返回新列表，不会修改 checkpoint。
 
-### 3.5 `RemoveMessage`
+### 4.4 `RemoveMessage`
 
-`RemoveMessage` 是 LangChain 提供的删除消息对象。
+`RemoveMessage` 是 LangChain 提供的删除消息对象：
 
 ```python
 from langchain_core.messages import RemoveMessage
 
-RemoveMessage(id="需要删除的消息id")
+RemoveMessage(id="要删除的消息id")
 ```
 
-它会被 `add_messages` 识别，并从当前 `messages` 历史中删除对应 `id` 的消息。
-
-当前代码中的配合方式：
+它必须配合 `add_messages` 使用：
 
 ```python
-kept_ids = {msg.id for msg in history if msg.id is not None}
-
-removals = [
-    RemoveMessage(id=msg.id)
-    for msg in state["messages"]
-    if msg.id is not None and msg.id not in kept_ids
-]
-```
-
-逻辑：
-
-1. 先用 `trim_messages` 算出保留窗口 `history`。
-2. 收集 `history` 中的消息 `id`。
-3. 对原历史中不在窗口内的消息生成 `RemoveMessage`。
-4. 把 `removals + [response]` 一起返回给 LangGraph。
-
-最终效果：
-
-- 窗口外的旧消息被删除。
-- 窗口内的消息保留。
-- 新的 AI 回复追加到历史。
-
-### 3.6 `get_checkpointer()` 与 `delete_thread()`
-
-`graph.py` 导出：
-
-```python
-def get_checkpointer():
-    return _checkpointer
-```
-
-CLI 和 Web 清空会话时使用：
-
-```python
-get_checkpointer().delete_thread(thread_id)
-```
-
-`delete_thread()` 会删除该 `thread_id` 下保存的 checkpoint 和 writes。之后再次使用同一个 `thread_id` 时，LangGraph 会当成新会话处理。
-
-## 4. 代码落地
-
-### 4.1 `graph.py`
-
-新增导入：
-
-```python
-from langchain_core.messages import RemoveMessage, trim_messages
-from langgraph.checkpoint.memory import InMemorySaver
-```
-
-新增常量与共享 checkpointer：
-
-```python
-MEMORY_WINDOW = 20
-
-_checkpointer = InMemorySaver()
-
-
-def get_checkpointer():
-    return _checkpointer
-```
-
-`think_node` 中的核心逻辑：
-
-```python
-history = trim_messages(
-    state["messages"],
-    max_tokens=MEMORY_WINDOW,
-    token_counter=len,
-    strategy="last",
-    start_on="human",
+add_messages(
+    old_messages,
+    [RemoveMessage(id="要删除的消息id"), AIMessage(content="新回复")],
 )
-
-response = llm_with_tools.invoke(history)
-
-kept_ids = {msg.id for msg in history if msg.id is not None}
-removals = [
-    RemoveMessage(id=msg.id)
-    for msg in state["messages"]
-    if msg.id is not None and msg.id not in kept_ids
-]
-
-return {
-    "messages": removals + [response],
-    "thought": response.content or "(AI 请求调用工具)",
-    "should_act": has_tool_calls,
-    "tool_calls": response.tool_calls or [],
-}
 ```
 
-`build_graph` 编译时挂载 checkpointer：
+作用：
+
+- 真正从 LangGraph state / checkpoint 中删除消息。
+- 与 `trim_messages` 配合时，`trim_messages` 负责“算”，`RemoveMessage` 负责“删”。
+
+### 4.5 `SystemMessage`
+
+`SystemMessage` 是系统级消息：
 
 ```python
-app = graph.compile(checkpointer=_checkpointer)
+from langchain_core.messages import SystemMessage
+
+SystemMessage(content="用户叫小明，正在讨论天气。")
 ```
 
-### 4.2 `__main__.py`
+本项目把摘要放在最前面：
 
-CLI 使用固定线程：
+```python
+llm_input = [SystemMessage(content=summary), *recent_history]
+```
+
+这样可以告诉 LLM：
+
+```text
+摘要：早期发生了什么
+最近消息：最近发生了什么
+```
+
+### 4.6 `count_tokens_approximately`
+
+该函数用于估算 token：
+
+```python
+from langchain_core.messages.utils import count_tokens_approximately
+
+count_tokens_approximately(messages)
+```
+
+特点：
+
+- 快速估算，不调用 LLM。
+- 会考虑消息内容、角色、名称。
+- 适合在热路径上判断是否需要摘要。
+
+---
+
+## 5. `memory.py` 详解
+
+### 5.1 常量与导入
+
+```python
+from langchain_core.messages import RemoveMessage, SystemMessage, trim_messages
+from langchain_core.messages.utils import count_tokens_approximately
+
+SUMMARY_TOKEN_THRESHOLD = 6000
+
+SUMMARY_PROMPT = (
+    "请把下面的对话内容压缩成简洁的中文摘要。"
+    "保留用户偏好、关键事实、已完成事项、未完成事项和重要实体。"
+    "不要输出与摘要无关的内容。"
+)
+```
+
+`SUMMARY_TOKEN_THRESHOLD` 是摘要触发阈值，默认 6000。
+
+### 5.2 `history_tokens()`
+
+```python
+def history_tokens(messages) -> int:
+    return count_tokens_approximately(messages)
+```
+
+用途：
+
+```text
+判断当前历史是否超过摘要阈值
+```
+
+### 5.3 `build_summary()`
+
+```python
+def build_summary(llm, retired_messages, old_summary: str = "") -> str:
+    if not retired_messages:
+        return old_summary
+
+    prompt = [SystemMessage(content=SUMMARY_PROMPT)]
+    if old_summary:
+        prompt.append(SystemMessage(content=f"已有摘要：\n{old_summary}"))
+    prompt.extend(retired_messages)
+
+    response = llm.invoke(prompt)
+    return str(response.content).strip()
+```
+
+要点：
+
+- 使用原始 `llm`，不是 `llm_with_tools`。
+- 避免摘要过程触发工具调用。
+- 如果已有摘要，会把旧摘要和新退休消息一起交给 LLM。
+- 返回值是字符串，写入 `summary` 字段。
+
+### 5.4 `prepare_conversation()`
+
+```python
+def prepare_conversation(state, llm, recent_window: int) -> tuple[str, list, list]:
+    messages = state["messages"]
+    old_summary = state.get("summary") or ""
+
+    recent_history = trim_messages(
+        messages,
+        max_tokens=recent_window,
+        token_counter=len,
+        strategy="last",
+        start_on="human",
+    )
+
+    if history_tokens(messages) <= SUMMARY_TOKEN_THRESHOLD:
+        return old_summary, recent_history, []
+
+    kept_ids = {msg.id for msg in recent_history if msg.id is not None}
+    retired_messages = [
+        msg
+        for msg in messages
+        if msg.id is not None and msg.id not in kept_ids
+    ]
+    if not retired_messages:
+        return old_summary, recent_history, []
+
+    summary = build_summary(llm, retired_messages, old_summary)
+    removals = [RemoveMessage(id=msg.id) for msg in retired_messages]
+    return summary, recent_history, removals
+```
+
+返回结构：
+
+```text
+(summary, recent_history, removals)
+```
+
+三种情况：
+
+```text
+情况 1：token 未超阈值
+  summary = 旧摘要
+  removals = []
+
+情况 2：token 超阈值，但没有可退休消息
+  summary = 旧摘要
+  removals = []
+
+情况 3：token 超阈值，有可退休消息
+  summary = 新摘要
+  removals = [RemoveMessage(...)]
+```
+
+为什么只在超阈值时删除：
+
+```text
+未超阈值时删除 = 丢失早期上下文
+超阈值时删除 = 早期上下文已经变成摘要
+```
+
+---
+
+## 6. `graph.py` 详解
+
+### 6.1 关键导入
+
+```python
+from typing import Annotated
+
+from langchain_core.messages import (
+    AIMessage,
+    ToolMessage,
+    SystemMessage,
+)
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import StateGraph, END
+from langgraph.graph.message import MessagesState
+
+from test2.memory import prepare_conversation
+```
+
+### 6.2 `think_node`
+
+```python
+def think_node(state: ReActState, llm_with_tools, llm) -> dict:
+    summary, recent_history, removals = prepare_conversation(
+        state,
+        llm,
+        MEMORY_WINDOW,
+    )
+
+    llm_input = recent_history
+    if summary:
+        llm_input = [SystemMessage(content=summary), *recent_history]
+
+    response = llm_with_tools.invoke(llm_input)
+
+    has_tool_calls = bool(response.tool_calls)
+
+    return {
+        "messages": removals + [response],
+        "thought": response.content or "(AI 请求调用工具)",
+        "should_act": has_tool_calls,
+        "tool_calls": response.tool_calls or [],
+        "summary": summary,
+    }
+```
+
+执行顺序：
+
+```text
+1. prepare_conversation()
+2. 构造 LLM 输入
+3. llm_with_tools.invoke()
+4. 判断是否有 tool_calls
+5. 返回 removals + AI 回复
+6. 返回 summary
+```
+
+关键点：
+
+- `recent_history` 只控制本次 LLM 输入。
+- `removals` 控制 checkpoint 删除。
+- `summary` 通过 reducer 持久化。
+- `llm_with_tools` 负责正常对话和工具调用。
+- `llm` 负责摘要生成。
+
+### 6.3 `build_graph`
+
+```python
+def build_graph(provider: str = "anthropic"):
+    llm = get_llm(provider)
+    llm_with_tools = llm.bind_tools(TOOLS)
+
+    graph = StateGraph(ReActState)
+
+    graph.add_node(
+        "think",
+        lambda state: think_node(state, llm_with_tools, llm),
+    )
+    graph.add_node("act", act_node)
+    graph.add_node("observe", observe_node)
+
+    graph.set_entry_point("think")
+
+    graph.add_conditional_edges(
+        "think",
+        should_continue,
+        {
+            "act": "act",
+            "end": END,
+        },
+    )
+
+    graph.add_edge("act", "observe")
+    graph.add_edge("observe", "think")
+
+    app = graph.compile(checkpointer=_checkpointer)
+    return app
+```
+
+注意：
+
+- `_checkpointer` 是模块级 `InMemorySaver`。
+- `llm` 和 `llm_with_tools` 都被传入 `think_node`。
+- 图结构没有新增节点，摘要逻辑仍集中在 `think_node`。
+
+---
+
+## 7. CLI 接入
+
+### 7.1 固定会话
 
 ```python
 THREAD_ID = "cli-default"
 ```
 
-调用图时传入：
+调用图：
 
 ```python
-config={
+config = {
     "recursion_limit": MAX_ITERATIONS * 3,
-    "configurable": {"thread_id": THREAD_ID},
+    "configurable": {
+        "thread_id": THREAD_ID
+    },
 }
 ```
 
-新增清空命令：
+### 7.2 清空会话
 
 ```python
 if user_input.lower() in ("clear", "/clear"):
@@ -280,24 +583,30 @@ if user_input.lower() in ("clear", "/clear"):
     continue
 ```
 
-### 4.3 `web.py`
+---
 
-Web 请求体新增 `session_id`：
+## 8. Web 接入
+
+### 8.1 `session_id`
+
+后端：
 
 ```python
 session_id = str(body.get("session_id") or "default").strip() or "default"
 ```
 
-图调用时把它映射为 `thread_id`：
+图调用：
 
 ```python
-config={
+config = {
     "recursion_limit": MAX_ITERATIONS * 3,
-    "configurable": {"thread_id": session_id},
+    "configurable": {
+        "thread_id": session_id
+    },
 }
 ```
 
-新增清空接口：
+### 8.2 `/api/clear`
 
 ```python
 @app.post("/api/clear")
@@ -308,9 +617,9 @@ async def clear_session(request: Request):
     return {"ok": True}
 ```
 
-### 4.4 `static/index.html`
+### 8.3 前端
 
-前端生成并保存会话 ID：
+生成并保存 session：
 
 ```javascript
 function getSessionId() {
@@ -324,13 +633,13 @@ function getSessionId() {
 }
 ```
 
-发送消息时携带：
+发送消息：
 
 ```javascript
 body: JSON.stringify({ message, session_id: getSessionId() })
 ```
 
-清空按钮：
+清空：
 
 ```javascript
 await fetch("/api/clear", {
@@ -343,94 +652,304 @@ messagesEl.innerHTML = "";
 statusEl.textContent = "已清空";
 ```
 
-## 5. 一次多轮对话的数据流
+---
 
-第一次提问：
+## 9. 完整数据流
+
+### 9.1 第一次提问
 
 ```text
-用户输入: 我叫小明
+用户: 我叫小明
    │
    ▼
-web: session_id = "abc"
-   │
-   ▼
-graph: thread_id = "abc"
+CLI/Web 传入:
+  thread_id = "abc"
+  messages = [HumanMessage("我叫小明")]
+  summary = ""
    │
    ▼
 think_node
-   ├── trim_messages 保留当前窗口
-   ├── LLM 回复
-   └── checkpoint 保存 [HumanMessage("我叫小明"), AIMessage("你好，小明")]
+  prepare_conversation
+    token 未超阈值
+    summary = ""
+    removals = []
+   │
+  LLM 输入 = [HumanMessage("我叫小明")]
+   │
+  LLM 回复 = "你好，小明"
+   │
+checkpoint:
+  messages = [HumanMessage("我叫小明"), AIMessage("你好，小明")]
+  summary = ""
 ```
 
-第二次提问：
+### 9.2 第二次提问
 
 ```text
-用户输入: 我叫什么名字？
+用户: 我叫什么名字？
    │
    ▼
-web: session_id = "abc"
+恢复 thread_id = "abc"
    │
    ▼
-graph: 先恢复 thread_id = "abc" 的历史
-   │
-   ▼
-new state.messages =
+state.messages =
   [HumanMessage("我叫小明"), AIMessage("你好，小明"), HumanMessage("我叫什么名字？")]
    │
    ▼
-think_node 送入 LLM
+prepare_conversation
+  token 未超阈值
+  recent_history = 上面 3 条
+  removals = []
+   │
+  LLM 输入 = 上面 3 条
+   │
+  LLM 回复 = "你叫小明"
 ```
 
-如果历史超过 `MEMORY_WINDOW`：
+### 9.3 摘要触发
 
 ```text
-state.messages 有 30 条
+state.messages token > 6000
    │
    ▼
-trim_messages 只保留最近 20 条
+recent_history = 最近 20 条
    │
    ▼
-对最早 10 条生成 RemoveMessage
+retired_messages = 20 条之外的历史
+   │
+   ▼
+build_summary(llm, retired_messages, old_summary)
+   │
+   ▼
+summary = "用户叫小明，之前讨论了天气..."
+   │
+   ▼
+removals = [RemoveMessage(...) for 旧消息]
+   │
+   ▼
+LLM 输入 = [SystemMessage(summary), *recent_history]
    │
    ▼
 返回 removals + 新 AIMessage
    │
    ▼
-checkpoint 中的 messages 被裁剪到 20 条左右
+checkpoint:
+  summary = "用户叫小明，之前讨论了天气..."
+  messages = recent_history + 新回复
 ```
 
-## 6. 关键边界
+---
 
-- `trim_messages` 不会自动删除 checkpoint 中的消息，必须配合 `RemoveMessage`。
-- 如果消息没有 `id`，无法生成可靠的 `RemoveMessage`；当前实现会跳过 `id is None` 的消息。
-- `start_on="human"` 是为了避免把 `ToolMessage` 作为裁剪后的第一条消息，防止模型收到不完整的工具调用对。
-- `InMemorySaver` 不是持久化存储，只适合当前 demo。
-- 清空会话不会删除前端的 `session_id`，只是删除后端该 `thread_id` 的 checkpoint。
-- Web 刷新页面后不会重新渲染历史聊天记录，但 LLM 上下文仍然存在。
+## 10. 边界与失败场景
 
-## 7. 后续扩展方向
+### 10.1 token 未超阈值
 
-- 使用 SQLite / Postgres checkpointer，让记忆跨进程、跨重启保留。
-- 使用 LangGraph Store 保存用户级长期偏好和实体。
-- 在 `observe_node` 或独立节点中加入动态摘要，压缩更早的历史。
-- 增加 DST 槽位状态，显式跟踪时间、地点、用户意图等业务字段。
-- 增加任务状态机，支持工具失败后的恢复和确认流程。
+行为：
 
-## 8. 验证方式
+- `trim_messages` 会限制本次 LLM 输入。
+- 但旧消息不会从 checkpoint 中删除。
+- 后续对话继续增长，直到触发摘要。
 
-当前实现已通过以下无 LLM 验证：
+原因：
+
+```text
+避免在没有摘要时永久丢失早期信息
+```
+
+### 10.2 `message.id is None`
+
+`RemoveMessage` 必须依赖消息 id：
+
+```python
+if msg.id is not None and msg.id not in kept_ids
+```
+
+如果消息没有 id，当前实现会跳过它，不删除。
+
+### 10.3 工具调用被裁剪
+
+风险：
+
+```text
+AIMessage(tool_calls) 和 ToolMessage 被拆开
+```
+
+缓解：
+
+```text
+start_on="human"
+```
+
+这会让裁剪后从 HumanMessage 开始，降低拆散工具调用对的风险。
+
+### 10.4 摘要生成失败
+
+当前行为：
+
+- `build_summary` 抛出异常时，`think_node` 会抛出。
+- CLI/Web 的异常处理会捕获并返回错误。
+
+后续建议：
+
+```text
+摘要失败时回退到旧 summary，而不是中断整次对话
+```
+
+### 10.5 内存丢失
+
+`InMemorySaver` 特性：
+
+- 进程内有效。
+- 服务重启后所有 thread 丢失。
+
+后续建议：
+
+```text
+换 SQLite / Postgres checkpointer
+```
+
+### 10.6 默认会话
+
+Web 如果没有传 `session_id`：
+
+```python
+session_id = "default"
+```
+
+风险：
+
+```text
+所有未传 session_id 的客户端共用同一个会话
+```
+
+前端已经自动生成 `session_id`，所以正常浏览器不会触发。
+
+### 10.7 清空会话
+
+清空只调用：
+
+```python
+get_checkpointer().delete_thread(thread_id)
+```
+
+效果：
+
+- 删除该 thread 的 checkpoint。
+- 删除该 thread 的 messages。
+- 删除该 thread 的 summary。
+- 前端 `session_id` 本身不删除。
+
+---
+
+## 11. 后续扩展方向
+
+当前未实现：
+
+- SQLite / Postgres 持久化。
+- 用户级长期记忆。
+- 向量检索。
+- DST 槽位。
+- 任务状态机。
+- 摘要失败回退。
+
+建议优先级：
+
+```text
+1. SQLite checkpointer
+2. 摘要失败回退
+3. LangGraph Store 用户偏好
+4. DST 槽位
+5. 向量检索
+```
+
+---
+
+## 12. 验证与测试
+
+### 12.1 已通过的验证
 
 ```text
 1. py_compile 编译通过
-2. trim_messages 最近窗口裁剪通过
-3. RemoveMessage 删除旧消息通过
-4. InMemorySaver 同一 thread_id 保留历史通过
-5. delete_thread 后同一 thread_id 从新会话开始通过
+2. count_tokens_approximately 估算通过
+3. summary reducer 不清空已有摘要通过
+4. 未超阈值时不删除旧消息通过
+5. 超阈值时生成摘要并返回 RemoveMessage 通过
+6. SystemMessage + recent_history 组合通过
+7. ReActState + InMemorySaver 保存/恢复 summary 通过
 ```
 
-如需完整功能验证：
+### 12.2 手动验证
 
-- CLI：连续提问两次，确认第二次能引用第一次上下文。
-- Web：浏览器发送两条消息，确认同一 `session_id` 下上下文连续。
-- 清空：CLI 输入 `clear`，Web 点击“清空”，再提问确认历史已重置。
+CLI：
+
+```text
+你: 我叫小明
+你: 我叫什么名字？
+```
+
+预期：
+
+```text
+第二次回答“你叫小明”
+```
+
+Web：
+
+```text
+同一浏览器发送两条消息
+```
+
+预期：
+
+```text
+第二条能引用第一条上下文
+```
+
+清空：
+
+```text
+CLI 输入 clear
+Web 点击清空
+```
+
+预期：
+
+```text
+再次提问从空历史开始
+```
+
+### 12.3 长对话摘要验证
+
+制造超过阈值的历史，然后观察：
+
+```text
+1. summary 字段被更新
+2. 早期消息被 RemoveMessage 删除
+3. LLM 仍能通过 summary 引用早期关键信息
+```
+
+---
+
+## 13. 总结
+
+当前记忆系统是标准的 LangGraph 方案：
+
+```text
+MessagesState
+  + add_messages
+  + InMemorySaver
+  + thread_id
+  + trim_messages
+  + RemoveMessage
+  + SystemMessage summary
+```
+
+它已经具备：
+
+- 会话隔离。
+- 多轮上下文。
+- token 阈值判断。
+- 动态摘要。
+- 内存状态清理。
+
+后续工程化重点是把内存替换为持久化存储，并补上摘要失败回退和用户级长期记忆。

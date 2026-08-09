@@ -102,6 +102,7 @@ async def chat(request: Request):
                 {
                     "messages": [HumanMessage(content=user_input)],
                     "thought": "",
+                    "summary": "",
                     "should_act": False,
                     "tool_calls": [],
                     "iteration": 0,

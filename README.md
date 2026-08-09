@@ -16,13 +16,9 @@
 ```bash
 cd test2
 
-# 方式一：uv（推荐）
+# uv（推荐）
 uv sync
-
-# 方式二：pip
-pip install -e .
 ```
-
 ## 配置
 
 1. 复制环境变量模板：
@@ -61,7 +57,7 @@ QWEATHER_API_KEY=your-api-key
 # 使用 .env 中配置的供应商
 uv run python -m test2 --app-dir src
 
-# 命令行覆盖供应商
+# 命令行覆盖供应商(不建议)
 uv run python -m test2 --app-dir src --provider zhipu
 uv run python -m test2 --app-dir src --provider ollama
 uv run python -m test2 --app-dir src --provider deepseek
@@ -104,6 +100,7 @@ uv run python -m uvicorn test2.web:app --reload --app-dir src
 - **CLI**：默认使用 `cli-default` 会话，连续提问会保留上下文；输入 `clear` 或 `/clear` 清空当前会话记忆。
 - **Web**：浏览器自动生成 `session_id` 并保存到 `localStorage`，后续消息复用同一会话；点击“清空”删除当前会话记忆。
 - **上下文窗口**：`think_node` 只把最近 `MEMORY_WINDOW`（默认 20）条消息送入 LLM，避免长对话上下文无限膨胀。
+- **动态摘要**：历史 token 超过 `SUMMARY_TOKEN_THRESHOLD`（默认 6000）时，用 LLM 压缩早期对话并更新会话摘要。
 - **限制**：记忆保存在内存中，服务重启后清空。
 
 ## 切换供应商

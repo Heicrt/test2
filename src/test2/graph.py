@@ -5,18 +5,19 @@ LangGraph 核心文件：ReAct 循环的图定义
     think → (需要行动?) → act → observe → think → ... → END
 """
 
+from typing import Annotated
+
 from langchain_core.messages import (
-    HumanMessage,
     AIMessage,
     ToolMessage,
-    RemoveMessage,
-    trim_messages,
+    SystemMessage,
 )
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import MessagesState
 
 from test2.config import get_llm
+from test2.memory import prepare_conversation
 from test2.tools import TOOLS, TOOL_MAP
 
 
@@ -27,9 +28,16 @@ from test2.tools import TOOLS, TOOL_MAP
 #   MessagesState 中只有包含 messages 字段 ，以及Annotated[list[AnyMessage], add_messages]
 # ============================================================
 
+def keep_existing_summary(old_value: str, new_value: str) -> str:
+    """空字符串不覆盖已有摘要，避免每次调用初始状态清空 summary。"""
+    return new_value if new_value else old_value
+
+
 class ReActState(MessagesState):
     """ReAct Agent 的状态"""
 
+    # 早期对话的动态摘要
+    summary: Annotated[str, keep_existing_summary]
     # 是否需要执行工具
     should_act: bool
     # 当前待执行的工具调用列表
@@ -44,38 +52,33 @@ class ReActState(MessagesState):
 #    每个节点：读取 state → 计算 → 返回要更新的字段
 # ============================================================
 
-def think_node(state: ReActState, llm_with_tools) -> dict:
+def think_node(state: ReActState, llm_with_tools, llm) -> dict:
     """
     Think 节点：AI 分析当前状态，决定下一步行动
 
     输入: state["messages"]（最近窗口内的对话历史）
     输出: 更新 thought, should_act, tool_calls, messages
     """
-    history = trim_messages(
-        state["messages"],
-        max_tokens=MEMORY_WINDOW,
-        token_counter=len,
-        strategy="last",
-        start_on="human",
+    summary, recent_history, removals = prepare_conversation(
+        state,
+        llm,
+        MEMORY_WINDOW,
     )
-    response = llm_with_tools.invoke(history)
+    llm_input = recent_history
+    if summary:
+        llm_input = [SystemMessage(content=summary), *recent_history]
+
+    response = llm_with_tools.invoke(llm_input)
 
     # 判断 AI 是否请求了工具调用
     has_tool_calls = bool(response.tool_calls)
-
-    # 超出窗口的旧消息从 checkpoint 中移除
-    kept_ids = {msg.id for msg in history if msg.id is not None}
-    removals = [
-        RemoveMessage(id=msg.id)
-        for msg in state["messages"]
-        if msg.id is not None and msg.id not in kept_ids
-    ]
 
     return {
         "messages": removals + [response],  # 裁剪旧历史 + AI 回复追加到历史
         "thought": response.content or "(AI 请求调用工具)",
         "should_act": has_tool_calls,
         "tool_calls": response.tool_calls or [],
+        "summary": summary,
     }
 
 
@@ -174,7 +177,7 @@ def build_graph(provider: str = "anthropic"):
     graph = StateGraph(ReActState)
 
     # 添加节点（lambda 包装用于注入 llm_with_tools）
-    graph.add_node("think", lambda state: think_node(state, llm_with_tools))
+    graph.add_node("think", lambda state: think_node(state, llm_with_tools, llm))
     graph.add_node("act", act_node)
     graph.add_node("observe", observe_node)
 
