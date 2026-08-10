@@ -149,6 +149,12 @@ uv run python -m uvicorn test2.web:app --reload --app-dir src
 你: 北京今天天气如何？如果温度升高3度是多少？
 ```
 
+## 自动化测试
+
+```bash
+uv run pytest
+```
+
 ## 项目结构
 
 ```
@@ -158,12 +164,21 @@ test2/
 ├── README.md
 ├── wiki.md                  # 逐行解析文档
 ├── pyproject.toml
+├── tests/
+│   ├── test_agent_session.py
+│   └── test_memory_contracts.py
 └── src/test2/
     ├── __main__.py          # CLI 运行入口
     ├── web.py               # Web 可视化入口（FastAPI + SSE）
     ├── config.py            # LLM 配置（查表模式）
     ├── providers.toml       # 供应商预设表
+    ├── state.py             # ReActState 与 summary reducer
+    ├── memory.py            # token 估算、摘要、消息裁剪
+    ├── memory_contracts.py  # MemoryStore Protocol 与长期记忆常量
+    ├── memory_store.py      # 项目级长期记忆 SQLite Store
     ├── graph.py             # LangGraph 图定义
+    ├── runtime.py           # create_runtime、AgentRuntime
+    ├── agent_session.py     # CLI/Web 共享 runner
     ├── tools.py             # 工具定义
     ├── static/
     │   └── index.html       # Web 前端（对话交互界面）

@@ -1,7 +1,7 @@
 """
 FastAPI + SSE 前端可视化入口（对话交互界面）
 
-复用 `__main__.py` 里已写好的 `agent.stream(stream_mode="updates")` 生成器，
+复用 `agent_session.stream_updates()` 生成器，
 把每一步 state 变化用 Server-Sent Events (SSE) 逐节点推送给浏览器。
 
 用法:
@@ -18,10 +18,9 @@ import os
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from langchain_core.messages import HumanMessage
 
 # 环境变量由 config.py 在导入 test2.graph 时从项目根目录统一加载
-from test2.graph import MAX_ITERATIONS
+from test2.agent_session import clear_thread, final_answer, stream_updates
 from test2.runtime import create_runtime
 
 # 本文件所在目录（static 与此同级）
@@ -101,37 +100,17 @@ async def chat(request: Request):
 
     def gen():
         yield sse("user", {"content": user_input})
-        all_messages = []
+        updates = []
         try:
-            steps = get_agent().stream(
-                {
-                    "messages": [HumanMessage(content=user_input)],
-                    "thought": "",
-                    "summary": "",
-                    "should_act": False,
-                    "tool_calls": [],
-                    "iteration": 0,
-                },
-                config={
-                    "recursion_limit": MAX_ITERATIONS * 6,
-                    "configurable": {"thread_id": session_id},
-                },
-                stream_mode="updates",
-            )
-            for step in steps:
-                for node_name, update in step.items():
-                    payload = render_node_payload(node_name, update)
-                    all_messages.extend(payload["messages"])
-                    yield sse("node", payload)
+            for node_name, update in stream_updates(
+                get_agent(),
+                user_input,
+                session_id,
+            ):
+                updates.append((node_name, update))
+                yield sse("node", render_node_payload(node_name, update))
 
-            # 最终回复：取最后一条非工具调用、有内容的 AI 消息
-            final_content = "（无最终回复）"
-            for m in reversed(all_messages):
-                if m["type"] == "AIMessage" and m["content"].strip():
-                    if not m.get("tool_calls"):
-                        final_content = m["content"]
-                        break
-            yield sse("final", {"content": final_content})
+            yield sse("final", {"content": final_answer(updates)})
             yield sse("done", {})
         except Exception as e:
             yield sse("error", {"message": str(e)})
@@ -143,7 +122,7 @@ async def chat(request: Request):
 async def clear_session(request: Request):
     body = await request.json()
     session_id = str(body.get("session_id") or "default").strip() or "default"
-    get_runtime().checkpointer.delete_thread(session_id)
+    clear_thread(get_runtime(), session_id)
     return {"ok": True}
 
 

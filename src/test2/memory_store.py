@@ -5,17 +5,10 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+from test2.memory_contracts import MEMORY_SCOPE
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "memory.db"
-MEMORY_SCOPE = "project"
-
-CATEGORIES = (
-    "user_preferences",
-    "project_facts",
-    "entities",
-    "key_decisions",
-    "unfinished_tasks",
-)
 
 MAX_FACTS_PER_CATEGORY = 100
 

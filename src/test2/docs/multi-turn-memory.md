@@ -27,9 +27,11 @@
 src/test2/
 ├── state.py          # ReActState 与 summary reducer
 ├── memory.py         # token 估算、摘要、消息裁剪
+├── memory_contracts.py # MemoryStore Protocol 与长期记忆常量
 ├── memory_store.py   # 项目级长期记忆 SQLite Store
 ├── graph.py          # 节点函数、边、显式 build_graph
 ├── runtime.py        # create_runtime、AgentRuntime、显式组合
+├── agent_session.py  # CLI/Web 共享 stream/clear/最终答案
 ├── __main__.py       # CLI 入口
 ├── web.py            # FastAPI + SSE 入口
 └── static/index.html # 前端 session_id 与清空按钮
@@ -101,12 +103,32 @@ data/memory.db
 保存项目级长期记忆
 ```
 
+### 2.6 `MemoryStore` Protocol
+
+作用：
+
+```text
+定义图面代码需要的长期记忆读写接口，避免 memory.py 直接依赖具体 SQLite Store
+```
+
+接口：
+
+```text
+get_memory_context(scope)  # 读取可注入 LLM 的长期记忆
+merge_facts(...)           # 写入并合并新事实
+```
+
+`LongTermMemoryStore` 是它的具体实现；测试和后续其他存储实现只需要满足这两个方法。
+
 ---
 
 ## 3. 总体架构
 
 ```text
 CLI / Web
+   │
+   ▼
+agent_session.stream_updates()
    │
    ▼
 thread_id / session_id
@@ -190,7 +212,7 @@ prepare_conversation()
 **接收**
 
 ```text
-memory_store：LongTermMemoryStore
+memory_store：MemoryStore（LongTermMemoryStore 是实现）
 ```
 
 **返回**
@@ -276,7 +298,7 @@ def build_recent_history_section(recent_history: list) -> list:
 **接收**
 
 ```text
-memory_store：LongTermMemoryStore
+memory_store：MemoryStore（LongTermMemoryStore 是实现）
 summary：会话摘要
 recent_history：最近消息
 ```
@@ -443,6 +465,8 @@ def prepare_conversation(state, llm, recent_window):
 ---
 
 ## 5. `memory_store.py` 逐函数解析
+
+`LongTermMemoryStore` 是 `MemoryStore` Protocol 的 SQLite 实现；`MEMORY_SCOPE` 和 `CATEGORIES` 从 `memory_contracts.py` 导入，避免存储实现与图面代码直接耦合。
 
 ### 5.1 `__init__(db_path=DEFAULT_DB_PATH)`
 
@@ -702,7 +726,7 @@ scope
 
 ---
 
-## 6. `state.py` / `graph.py` / `runtime.py` 逐函数解析
+## 6. `state.py` / `graph.py` / `runtime.py` / `agent_session.py` / `memory_contracts.py` 逐函数解析
 
 ### 6.1 `state.py` · `keep_existing_summary(old_value, new_value)`
 
@@ -778,7 +802,7 @@ def parse_memory_json(content):
 state：ReActState
 llm_with_tools：绑定工具的 LLM
 llm：原始 LLM
-memory_store：LongTermMemoryStore
+memory_store：MemoryStore（LongTermMemoryStore 是实现）
 ```
 
 **返回**
@@ -835,7 +859,7 @@ def think_node(state, llm_with_tools, llm, memory_store):
 ```text
 state：ReActState
 llm：原始 LLM
-memory_store：LongTermMemoryStore
+memory_store：MemoryStore（LongTermMemoryStore 是实现）
 ```
 
 **返回**
@@ -1003,7 +1027,7 @@ AgentRuntime
 ```text
 provider：LLM 提供商
 checkpointer：LangGraph checkpointer
-memory_store：LongTermMemoryStore
+memory_store：MemoryStore（LongTermMemoryStore 是实现）
 ```
 
 **返回**
@@ -1054,6 +1078,68 @@ think
   └── extract → END
 ```
 
+### 6.11 `agent_session.py` · `stream_updates(app, user_message, thread_id)`
+
+**接收**
+
+```text
+app：编译后的 LangGraph app
+user_message：用户输入文本
+thread_id：会话 ID
+```
+
+**返回**
+
+```text
+Iterator[(node_name, update)]：扁平化的节点更新流
+```
+
+**作用**
+
+```text
+统一构造初始 state 和 config，让 CLI/Web 共享同一套 stream 调用
+```
+
+### 6.12 `agent_session.py` · `final_answer(updates)`
+
+**接收**
+
+```text
+updates：(node_name, update) 列表或可迭代对象
+```
+
+**返回**
+
+```text
+str：最后一个非工具调用、非空内容的 AIMessage
+```
+
+**作用**
+
+```text
+CLI/Web 使用同一种最终回复提取规则
+```
+
+### 6.13 `memory_contracts.py` · `MemoryStore`
+
+**接收**
+
+```text
+无实例化参数；它是 Protocol，不创建对象
+```
+
+**返回**
+
+```text
+接口定义，不是可运行实现
+```
+
+**作用**
+
+```text
+约束 memory.py 只依赖 get_memory_context / merge_facts，不依赖 SQLite 具体类
+```
+
 ---
 
 ## 7. CLI 入口逐函数解析
@@ -1081,23 +1167,22 @@ CLI 交互入口
 **记忆相关逻辑**
 
 ```python
-THREAD_ID = "cli-default"
+THREAD_ID = DEFAULT_THREAD_ID
 
 if user_input.lower() in ("clear", "/clear"):
-    runtime.checkpointer.delete_thread(THREAD_ID)
+    clear_thread(runtime, THREAD_ID)
     print("\n🧹 已清空当前会话记忆")
     continue
+
+updates = list(stream_updates(app, user_input, THREAD_ID))
+all_messages = collect_messages(updates)
+final_content = final_answer(updates)
 ```
 
 调用图：
 
 ```python
-config = {
-    "recursion_limit": MAX_ITERATIONS * 6,
-    "configurable": {
-        "thread_id": THREAD_ID
-    },
-}
+config = session_config(THREAD_ID)
 ```
 
 ---
@@ -1129,12 +1214,11 @@ StreamingResponse
 ```python
 session_id = str(body.get("session_id") or "default").strip() or "default"
 
-config = {
-    "recursion_limit": MAX_ITERATIONS * 6,
-    "configurable": {
-        "thread_id": session_id
-    },
-}
+for node_name, update in stream_updates(get_agent(), user_input, session_id):
+    updates.append((node_name, update))
+    yield sse("node", render_node_payload(node_name, update))
+
+yield sse("final", {"content": final_answer(updates)})
 ```
 
 ### 8.2 `clear_session(request)`
@@ -1162,7 +1246,7 @@ request：FastAPI Request
 async def clear_session(request: Request):
     body = await request.json()
     session_id = str(body.get("session_id") or "default").strip() or "default"
-    get_runtime().checkpointer.delete_thread(session_id)
+    clear_thread(get_runtime(), session_id)
     return {"ok": True}
 ```
 
@@ -1372,6 +1456,7 @@ data/memory.db
 5. SqliteSaver 持久化通过
 6. LongTermMemoryStore 合并去重通过
 7. extract_node 失败不中断通过
+8. pytest 自动化测试通过
 ```
 
 ---

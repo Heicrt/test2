@@ -6,7 +6,7 @@ from langchain_core.messages import RemoveMessage, SystemMessage, trim_messages
 from langchain_core.messages.utils import count_tokens_approximately
 from langgraph.config import get_config
 
-from test2.memory_store import CATEGORIES, MEMORY_SCOPE
+from test2.memory_contracts import CATEGORIES, MEMORY_SCOPE, MemoryStore
 
 SUMMARY_TOKEN_THRESHOLD = 6000
 
@@ -46,7 +46,7 @@ def parse_memory_json(content: str) -> dict:
     return data
 
 
-def extract_memory_facts(state, llm, memory_store) -> dict:
+def extract_memory_facts(state, llm, memory_store: MemoryStore) -> dict:
     """最终回复后提取项目级长期记忆；失败时保留旧记忆，不中断对话。"""
     try:
         config = get_config()
@@ -80,7 +80,7 @@ def history_tokens(messages) -> int:
     return count_tokens_approximately(messages)
 
 
-def build_long_term_memory_section(memory_store) -> list:
+def build_long_term_memory_section(memory_store: MemoryStore) -> list:
     """构造项目级长期记忆 SystemMessage 段。"""
     context = memory_store.get_memory_context(MEMORY_SCOPE)
     if not context:
@@ -100,7 +100,11 @@ def build_recent_history_section(recent_history: list) -> list:
     return list(recent_history)
 
 
-def compose_llm_input(memory_store, summary: str, recent_history: list) -> list:
+def compose_llm_input(
+    memory_store: MemoryStore,
+    summary: str,
+    recent_history: list,
+) -> list:
     """按顺序组装长期记忆、会话摘要、最近消息。"""
     return (
         build_long_term_memory_section(memory_store)
