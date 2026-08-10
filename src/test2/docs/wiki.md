@@ -2716,6 +2716,9 @@ def stream_updates(
     ):
         # 把原始 step dict 扁平化为 (node_name, update)
         for node_name, update in step.items():
+            # LangGraph 用 None 表示节点没有产生状态更新（如 extract 返回空 dict）
+            if update is None:
+                continue
             # 逐个 yield，让 CLI/Web 保持流式能力
             yield node_name, update
 ```
@@ -2730,11 +2733,11 @@ def stream_updates(
 
 **数据流举例**
 
-app.stream -> step -> (node_name, update) yield。
+app.stream -> step -> 跳过空更新 -> (node_name, update) yield。
 
 **关键点与边界**
 
-CLI list 收集，Web 边收边发 SSE。
+跳过 `None` 空更新，避免 `collect_messages()` / Web 渲染对 `None.get()` 崩溃；CLI list 收集，Web 边收边发 SSE。
 
 **伪代码调用示例**
 

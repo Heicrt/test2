@@ -47,6 +47,9 @@ def stream_updates(
         stream_mode="updates",
     ):
         for node_name, update in step.items():
+            # LangGraph 用 None 表示节点没有产生状态更新（如 extract 返回空 dict）
+            if update is None:
+                continue
             yield node_name, update
 
 

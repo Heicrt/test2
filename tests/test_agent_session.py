@@ -83,6 +83,23 @@ def test_stream_updates_flattens_node_updates():
     assert app.last_state["messages"][0].content == "你好"
 
 
+def test_stream_updates_skips_none_node_updates():
+    app = FakeApp(
+        [
+            {"think": {"messages": []}},
+            {"extract": None},
+            {"act": {"iteration": 1}},
+        ]
+    )
+
+    updates = list(stream_updates(app, "你好", "thread-1"))
+
+    assert updates == [
+        ("think", {"messages": []}),
+        ("act", {"iteration": 1}),
+    ]
+
+
 def test_clear_thread_delegates_to_checkpointer():
     runtime = FakeRuntime()
 
