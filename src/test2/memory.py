@@ -3,6 +3,8 @@
 from langchain_core.messages import RemoveMessage, SystemMessage, trim_messages
 from langchain_core.messages.utils import count_tokens_approximately
 
+from test2.memory_store import MEMORY_SCOPE
+
 SUMMARY_TOKEN_THRESHOLD = 6000
 
 SUMMARY_PROMPT = (
@@ -15,6 +17,35 @@ SUMMARY_PROMPT = (
 def history_tokens(messages) -> int:
     """估算一段消息历史约占用的 token 数。"""
     return count_tokens_approximately(messages)
+
+
+def build_long_term_memory_section(memory_store) -> list:
+    """构造项目级长期记忆 SystemMessage 段。"""
+    context = memory_store.get_memory_context(MEMORY_SCOPE)
+    if not context:
+        return []
+    return [SystemMessage(content=f"项目长期记忆：\n{context}")]
+
+
+def build_summary_section(summary: str) -> list:
+    """构造会话摘要 SystemMessage 段。"""
+    if not summary:
+        return []
+    return [SystemMessage(content=summary)]
+
+
+def build_recent_history_section(recent_history: list) -> list:
+    """返回最近消息列表，不负责裁剪。"""
+    return list(recent_history)
+
+
+def compose_llm_input(memory_store, summary: str, recent_history: list) -> list:
+    """按顺序组装长期记忆、会话摘要、最近消息。"""
+    return (
+        build_long_term_memory_section(memory_store)
+        + build_summary_section(summary)
+        + build_recent_history_section(recent_history)
+    )
 
 
 def build_summary(llm, retired_messages, old_summary: str = "") -> str:

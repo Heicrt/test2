@@ -105,7 +105,7 @@ def main():
                     "iteration": 0,
                 },
                 config={
-                    "recursion_limit": MAX_ITERATIONS * 3,
+                    "recursion_limit": MAX_ITERATIONS * 6,
                     "configurable": {"thread_id": THREAD_ID},
                 },
                 stream_mode="updates",

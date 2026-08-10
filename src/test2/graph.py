@@ -5,6 +5,8 @@ LangGraph 核心文件：ReAct 循环的图定义
     think → (需要行动?) → act → observe → think → ... → END
 """
 
+import json
+import sqlite3
 from typing import Annotated
 
 from langchain_core.messages import (
@@ -12,12 +14,19 @@ from langchain_core.messages import (
     ToolMessage,
     SystemMessage,
 )
-from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.config import get_config
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import MessagesState
 
 from test2.config import get_llm
-from test2.memory import prepare_conversation
+from test2.memory import compose_llm_input, prepare_conversation
+from test2.memory_store import (
+    CATEGORIES,
+    DEFAULT_DB_PATH,
+    MEMORY_SCOPE,
+    LongTermMemoryStore,
+)
 from test2.tools import TOOLS, TOOL_MAP
 
 
@@ -52,7 +61,36 @@ class ReActState(MessagesState):
 #    每个节点：读取 state → 计算 → 返回要更新的字段
 # ============================================================
 
-def think_node(state: ReActState, llm_with_tools, llm) -> dict:
+EXTRACT_PROMPT = (
+    "请从下面的对话中提取值得长期记住的信息，只输出 JSON，不要输出其他内容。"
+    "JSON 格式如下：\n"
+    "{\n"
+    '  "user_preferences": [],\n'
+    '  "project_facts": [],\n'
+    '  "entities": [],\n'
+    '  "key_decisions": [],\n'
+    '  "unfinished_tasks": []\n'
+    "}\n"
+    "每个数组只放简洁、独立、可复用的中文事实。"
+)
+
+
+def _parse_memory_json(content: str) -> dict:
+    text = str(content).strip()
+    if text.startswith("```"):
+        lines = [
+            line
+            for line in text.splitlines()
+            if not line.startswith("```")
+        ]
+        text = "\n".join(lines).strip()
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("memory extraction must return a JSON object")
+    return data
+
+
+def think_node(state: ReActState, llm_with_tools, llm, memory_store) -> dict:
     """
     Think 节点：AI 分析当前状态，决定下一步行动
 
@@ -64,9 +102,7 @@ def think_node(state: ReActState, llm_with_tools, llm) -> dict:
         llm,
         MEMORY_WINDOW,
     )
-    llm_input = recent_history
-    if summary:
-        llm_input = [SystemMessage(content=summary), *recent_history]
+    llm_input = compose_llm_input(memory_store, summary, recent_history)
 
     response = llm_with_tools.invoke(llm_input)
 
@@ -80,6 +116,35 @@ def think_node(state: ReActState, llm_with_tools, llm) -> dict:
         "tool_calls": response.tool_calls or [],
         "summary": summary,
     }
+
+
+def extract_node(state: ReActState, llm, memory_store) -> dict:
+    """最终回复后提取项目级长期记忆；失败时保留旧记忆，不中断对话。"""
+    try:
+        config = get_config()
+        thread_id = config.get("configurable", {}).get("thread_id")
+
+        prompt = [SystemMessage(content=EXTRACT_PROMPT)]
+        if state.get("summary"):
+            prompt.append(
+                SystemMessage(content=f"会话摘要：\n{state['summary']}")
+            )
+        prompt.extend(state["messages"])
+
+        response = llm.invoke(prompt)
+        data = _parse_memory_json(response.content)
+        for category in CATEGORIES:
+            facts = data.get(category)
+            if isinstance(facts, list):
+                memory_store.merge_facts(
+                    MEMORY_SCOPE,
+                    category,
+                    facts,
+                    source_thread_id=thread_id,
+                )
+    except Exception as e:
+        print(f"[memory] 长期记忆提取失败: {e}")
+    return {}
 
 
 def act_node(state: ReActState) -> dict:
@@ -149,12 +214,21 @@ def should_continue(state: ReActState) -> str:
 MAX_ITERATIONS = 35  # 最大循环次数（防止无限循环）
 MEMORY_WINDOW = 20  # 送入 LLM 的最近消息条数
 
-_checkpointer = InMemorySaver()
+_memory_db_path = DEFAULT_DB_PATH
+_memory_db_path.parent.mkdir(parents=True, exist_ok=True)
+_checkpointer_conn = sqlite3.connect(str(_memory_db_path), check_same_thread=False)
+_checkpointer = SqliteSaver(_checkpointer_conn)
+_memory_store = LongTermMemoryStore(_memory_db_path)
 
 
 def get_checkpointer():
-    """返回当前进程共享的内存 checkpointer。"""
+    """返回当前进程共享的 SQLite checkpointer。"""
     return _checkpointer
+
+
+def get_memory_store():
+    """返回项目级长期记忆 Store。"""
+    return _memory_store
 
 
 def build_graph(provider: str = "anthropic"):
@@ -176,27 +250,35 @@ def build_graph(provider: str = "anthropic"):
     # 创建状态图
     graph = StateGraph(ReActState)
 
-    # 添加节点（lambda 包装用于注入 llm_with_tools）
-    graph.add_node("think", lambda state: think_node(state, llm_with_tools, llm))
+    # 添加节点（lambda 包装用于注入 llm_with_tools / llm / memory_store）
+    graph.add_node(
+        "think",
+        lambda state: think_node(state, llm_with_tools, llm, _memory_store),
+    )
     graph.add_node("act", act_node)
     graph.add_node("observe", observe_node)
+    graph.add_node(
+        "extract",
+        lambda state: extract_node(state, llm, _memory_store),
+    )
 
     # 设置入口
     graph.set_entry_point("think")
 
-    # 添加条件边：think → 需要行动? → act 或 END
+    # 添加条件边：think → 需要行动? → act 或 extract
     graph.add_conditional_edges(
         "think",
         should_continue,
         {
             "act": "act",
-            "end": END,
+            "end": "extract",
         },
     )#左边是should_continue返回的字符串，右边是节点名称
     
     # 添加普通边：act → observe → think（形成循环）
     graph.add_edge("act", "observe")
     graph.add_edge("observe", "think")
+    graph.add_edge("extract", END)
 
     # 编译图
     app = graph.compile(checkpointer=_checkpointer)

@@ -95,13 +95,14 @@ uv run python -m uvicorn test2.web:app --reload --app-dir src
 
 ## 多轮记忆
 
-项目使用 LangGraph `InMemorySaver` 提供同一进程内的多轮对话记忆：
+项目使用 LangGraph SQLite checkpointer 提供多轮对话记忆：
 
 - **CLI**：默认使用 `cli-default` 会话，连续提问会保留上下文；输入 `clear` 或 `/clear` 清空当前会话记忆。
 - **Web**：浏览器自动生成 `session_id` 并保存到 `localStorage`，后续消息复用同一会话；点击“清空”删除当前会话记忆。
 - **上下文窗口**：`think_node` 只把最近 `MEMORY_WINDOW`（默认 20）条消息送入 LLM，避免长对话上下文无限膨胀。
 - **动态摘要**：历史 token 超过 `SUMMARY_TOKEN_THRESHOLD`（默认 6000）时，用 LLM 压缩早期对话并更新会话摘要。
-- **限制**：记忆保存在内存中，服务重启后清空。
+- **持久化**：对话 checkpoint 保存在 `data/memory.db`，服务重启后仍可恢复。
+- **长期记忆**：每次完成最终回复后，LLM 会提取用户偏好、项目事实、关键决策等，保存到项目级 `data/memory.db`。
 
 ## 切换供应商
 

@@ -108,7 +108,7 @@ async def chat(request: Request):
                     "iteration": 0,
                 },
                 config={
-                    "recursion_limit": MAX_ITERATIONS * 3,
+                    "recursion_limit": MAX_ITERATIONS * 6,
                     "configurable": {"thread_id": session_id},
                 },
                 stream_mode="updates",
