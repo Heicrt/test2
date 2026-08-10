@@ -1,9 +1,12 @@
-"""对话记忆工具：token 估算、动态摘要和旧消息裁剪。"""
+"""对话记忆工具：token 估算、动态摘要、旧消息裁剪和长期记忆提取。"""
+
+import json
 
 from langchain_core.messages import RemoveMessage, SystemMessage, trim_messages
 from langchain_core.messages.utils import count_tokens_approximately
+from langgraph.config import get_config
 
-from test2.memory_store import MEMORY_SCOPE
+from test2.memory_store import CATEGORIES, MEMORY_SCOPE
 
 SUMMARY_TOKEN_THRESHOLD = 6000
 
@@ -12,6 +15,64 @@ SUMMARY_PROMPT = (
     "保留用户偏好、关键事实、已完成事项、未完成事项和重要实体。"
     "不要输出与摘要无关的内容。"
 )
+
+EXTRACT_PROMPT = (
+    "请从下面的对话中提取值得长期记住的信息，只输出 JSON，不要输出其他内容。"
+    "JSON 格式如下：\n"
+    "{\n"
+    '  "user_preferences": [],\n'
+    '  "project_facts": [],\n'
+    '  "entities": [],\n'
+    '  "key_decisions": [],\n'
+    '  "unfinished_tasks": []\n'
+    "}\n"
+    "每个数组只放简洁、独立、可复用的中文事实。"
+)
+
+
+def parse_memory_json(content: str) -> dict:
+    """解析 LLM 返回的长期记忆 JSON。"""
+    text = str(content).strip()
+    if text.startswith("```"):
+        lines = [
+            line
+            for line in text.splitlines()
+            if not line.startswith("```")
+        ]
+        text = "\n".join(lines).strip()
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("memory extraction must return a JSON object")
+    return data
+
+
+def extract_memory_facts(state, llm, memory_store) -> dict:
+    """最终回复后提取项目级长期记忆；失败时保留旧记忆，不中断对话。"""
+    try:
+        config = get_config()
+        thread_id = config.get("configurable", {}).get("thread_id")
+
+        prompt = [SystemMessage(content=EXTRACT_PROMPT)]
+        if state.get("summary"):
+            prompt.append(
+                SystemMessage(content=f"会话摘要：\n{state['summary']}")
+            )
+        prompt.extend(state["messages"])
+
+        response = llm.invoke(prompt)
+        data = parse_memory_json(response.content)
+        for category in CATEGORIES:
+            facts = data.get(category)
+            if isinstance(facts, list):
+                memory_store.merge_facts(
+                    MEMORY_SCOPE,
+                    category,
+                    facts,
+                    source_thread_id=thread_id,
+                )
+    except Exception as e:
+        print(f"[memory] 长期记忆提取失败: {e}")
+    return {}
 
 
 def history_tokens(messages) -> int:

@@ -25,9 +25,11 @@
 
 ```text
 src/test2/
+├── state.py          # ReActState 与 summary reducer
 ├── memory.py         # token 估算、摘要、消息裁剪
 ├── memory_store.py   # 项目级长期记忆 SQLite Store
-├── graph.py          # ReActState、think_node、extract_node、build_graph
+├── graph.py          # 节点函数、边、显式 build_graph
+├── runtime.py        # create_runtime、AgentRuntime、显式组合
 ├── __main__.py       # CLI 入口
 ├── web.py            # FastAPI + SSE 入口
 └── static/index.html # 前端 session_id 与清空按钮
@@ -700,9 +702,9 @@ scope
 
 ---
 
-## 6. `graph.py` 逐函数解析
+## 6. `state.py` / `graph.py` / `runtime.py` 逐函数解析
 
-### 6.1 `keep_existing_summary(old_value, new_value)`
+### 6.1 `state.py` · `keep_existing_summary(old_value, new_value)`
 
 **接收**
 
@@ -730,7 +732,7 @@ def keep_existing_summary(old_value, new_value):
     return new_value if new_value else old_value
 ```
 
-### 6.2 `_parse_memory_json(content)`
+### 6.2 `memory.py` · `parse_memory_json(content)`
 
 **接收**
 
@@ -753,7 +755,7 @@ dict：解析后的 JSON
 **逻辑**
 
 ```python
-def _parse_memory_json(content):
+def parse_memory_json(content):
     text = str(content).strip()
     if text.startswith("```"):
         lines = [
@@ -826,7 +828,7 @@ def think_node(state, llm_with_tools, llm, memory_store):
 6. 返回 summary
 ```
 
-### 6.4 `extract_node(state, llm, memory_store)`
+### 6.4 `memory.py` · `extract_memory_facts(state, llm, memory_store)`
 
 **接收**
 
@@ -851,7 +853,7 @@ dict：通常是空 dict
 **逻辑**
 
 ```python
-def extract_node(state, llm, memory_store):
+def extract_memory_facts(state, llm, memory_store):
     try:
         config = get_config()
         thread_id = config.get("configurable", {}).get("thread_id")
@@ -862,7 +864,7 @@ def extract_node(state, llm, memory_store):
         prompt.extend(state["messages"])
 
         response = llm.invoke(prompt)
-        data = _parse_memory_json(response.content)
+        data = parse_memory_json(response.content)
         for category in CATEGORIES:
             facts = data.get(category)
             if isinstance(facts, list):
@@ -951,52 +953,57 @@ state：ReActState
 决定 think 后进入 act 还是 extract
 ```
 
-### 6.8 `get_checkpointer()`
+### 6.8 `runtime.py` · `AgentRuntime`
 
 **接收**
 
 ```text
-无
+app、checkpointer、memory_store、db_path、conn
 ```
 
 **返回**
 
 ```text
-SqliteSaver 实例
+AgentRuntime 实例
 ```
 
 **作用**
 
 ```text
-供 CLI/Web 清空会话
+保存一个 Agent 实例的共享依赖
 ```
 
-### 6.9 `get_memory_store()`
+`AgentRuntime.close()` 负责关闭 SQLite 连接。
 
-**接收**
-
-```text
-无
-```
-
-**返回**
-
-```text
-LongTermMemoryStore 实例
-```
-
-**作用**
-
-```text
-供外部读取项目级长期记忆
-```
-
-### 6.10 `build_graph(provider="anthropic")`
+### 6.9 `runtime.py` · `create_runtime(provider, db_path=None)`
 
 **接收**
 
 ```text
 provider：LLM 提供商
+db_path：SQLite 文件路径
+```
+
+**返回**
+
+```text
+AgentRuntime
+```
+
+**作用**
+
+```text
+显式创建 checkpointer、memory store 和编译后的图
+```
+
+### 6.10 `graph.py` · `build_graph(provider, *, checkpointer, memory_store)`
+
+**接收**
+
+```text
+provider：LLM 提供商
+checkpointer：LangGraph checkpointer
+memory_store：LongTermMemoryStore
 ```
 
 **返回**
@@ -1008,21 +1015,21 @@ provider：LLM 提供商
 **作用**
 
 ```text
-组装 StateGraph 并挂载 SqliteSaver
+组装 StateGraph；不创建数据库，不产生 import 副作用
 ```
 
 **逻辑**
 
 ```python
-def build_graph(provider="anthropic"):
+def build_graph(provider, *, checkpointer, memory_store):
     llm = get_llm(provider)
     llm_with_tools = llm.bind_tools(TOOLS)
 
     graph = StateGraph(ReActState)
-    graph.add_node("think", lambda state: think_node(state, llm_with_tools, llm, _memory_store))
+    graph.add_node("think", lambda state: think_node(state, llm_with_tools, llm, memory_store))
     graph.add_node("act", act_node)
     graph.add_node("observe", observe_node)
-    graph.add_node("extract", lambda state: extract_node(state, llm, _memory_store))
+    graph.add_node("extract", lambda state: extract_memory_facts(state, llm, memory_store))
 
     graph.add_conditional_edges(
         "think",
@@ -1036,8 +1043,7 @@ def build_graph(provider="anthropic"):
     graph.add_edge("observe", "think")
     graph.add_edge("extract", END)
 
-    app = graph.compile(checkpointer=_checkpointer)
-    return app
+    return graph.compile(checkpointer=checkpointer)
 ```
 
 图流程：
@@ -1078,7 +1084,7 @@ CLI 交互入口
 THREAD_ID = "cli-default"
 
 if user_input.lower() in ("clear", "/clear"):
-    get_checkpointer().delete_thread(THREAD_ID)
+    runtime.checkpointer.delete_thread(THREAD_ID)
     print("\n🧹 已清空当前会话记忆")
     continue
 ```
@@ -1156,7 +1162,7 @@ request：FastAPI Request
 async def clear_session(request: Request):
     body = await request.json()
     session_id = str(body.get("session_id") or "default").strip() or "default"
-    get_checkpointer().delete_thread(session_id)
+    get_runtime().checkpointer.delete_thread(session_id)
     return {"ok": True}
 ```
 

@@ -1,101 +1,24 @@
-"""
-LangGraph 核心文件：ReAct 循环的图定义
+"""LangGraph 核心文件：ReAct 循环的图定义。"""
 
-这是整个项目的心脏。用 ~80 行代码画出 ReAct 循环：
-    think → (需要行动?) → act → observe → think → ... → END
-"""
-
-import json
-import sqlite3
-from typing import Annotated
-
-from langchain_core.messages import (
-    AIMessage,
-    ToolMessage,
-    SystemMessage,
-)
-from langgraph.checkpoint.sqlite import SqliteSaver
-from langgraph.config import get_config
+from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.graph import StateGraph, END
-from langgraph.graph.message import MessagesState
 
 from test2.config import get_llm
-from test2.memory import compose_llm_input, prepare_conversation
-from test2.memory_store import (
-    CATEGORIES,
-    DEFAULT_DB_PATH,
-    MEMORY_SCOPE,
-    LongTermMemoryStore,
+from test2.memory import (
+    compose_llm_input,
+    extract_memory_facts,
+    prepare_conversation,
 )
+from test2.state import ReActState
 from test2.tools import TOOLS, TOOL_MAP
-
-
-# ============================================================
-# 1. State（状态）定义
-#    在所有节点之间传递的数据结构
-#    MessagesState = 官方消息列表 + add_messages 合并器
-#   MessagesState 中只有包含 messages 字段 ，以及Annotated[list[AnyMessage], add_messages]
-# ============================================================
-
-def keep_existing_summary(old_value: str, new_value: str) -> str:
-    """空字符串不覆盖已有摘要，避免每次调用初始状态清空 summary。"""
-    return new_value if new_value else old_value
-
-
-class ReActState(MessagesState):
-    """ReAct Agent 的状态"""
-
-    # 早期对话的动态摘要
-    summary: Annotated[str, keep_existing_summary]
-    # 是否需要执行工具
-    should_act: bool
-    # 当前待执行的工具调用列表
-    tool_calls: list
-    # 循环计数（防止无限循环）
-    iteration: int
-
- 
-
-# ============================================================
-# 2. 节点函数
-#    每个节点：读取 state → 计算 → 返回要更新的字段
-# ============================================================
-
-EXTRACT_PROMPT = (
-    "请从下面的对话中提取值得长期记住的信息，只输出 JSON，不要输出其他内容。"
-    "JSON 格式如下：\n"
-    "{\n"
-    '  "user_preferences": [],\n'
-    '  "project_facts": [],\n'
-    '  "entities": [],\n'
-    '  "key_decisions": [],\n'
-    '  "unfinished_tasks": []\n'
-    "}\n"
-    "每个数组只放简洁、独立、可复用的中文事实。"
-)
-
-
-def _parse_memory_json(content: str) -> dict:
-    text = str(content).strip()
-    if text.startswith("```"):
-        lines = [
-            line
-            for line in text.splitlines()
-            if not line.startswith("```")
-        ]
-        text = "\n".join(lines).strip()
-    data = json.loads(text)
-    if not isinstance(data, dict):
-        raise ValueError("memory extraction must return a JSON object")
-    return data
 
 
 def think_node(state: ReActState, llm_with_tools, llm, memory_store) -> dict:
     """
-    Think 节点：AI 分析当前状态，决定下一步行动
+    Think 节点：AI 分析当前状态，决定下一步行动。
 
-    输入: state["messages"]（最近窗口内的对话历史）
-    输出: 更新 thought, should_act, tool_calls, messages
+    接收：ReActState、绑定工具的 LLM、原始 LLM、长期记忆 Store
+    返回：本轮状态更新 dict
     """
     summary, recent_history, removals = prepare_conversation(
         state,
@@ -110,7 +33,7 @@ def think_node(state: ReActState, llm_with_tools, llm, memory_store) -> dict:
     has_tool_calls = bool(response.tool_calls)
 
     return {
-        "messages": removals + [response],  # 裁剪旧历史 + AI 回复追加到历史
+        "messages": removals + [response],
         "thought": response.content or "(AI 请求调用工具)",
         "should_act": has_tool_calls,
         "tool_calls": response.tool_calls or [],
@@ -118,41 +41,12 @@ def think_node(state: ReActState, llm_with_tools, llm, memory_store) -> dict:
     }
 
 
-def extract_node(state: ReActState, llm, memory_store) -> dict:
-    """最终回复后提取项目级长期记忆；失败时保留旧记忆，不中断对话。"""
-    try:
-        config = get_config()
-        thread_id = config.get("configurable", {}).get("thread_id")
-
-        prompt = [SystemMessage(content=EXTRACT_PROMPT)]
-        if state.get("summary"):
-            prompt.append(
-                SystemMessage(content=f"会话摘要：\n{state['summary']}")
-            )
-        prompt.extend(state["messages"])
-
-        response = llm.invoke(prompt)
-        data = _parse_memory_json(response.content)
-        for category in CATEGORIES:
-            facts = data.get(category)
-            if isinstance(facts, list):
-                memory_store.merge_facts(
-                    MEMORY_SCOPE,
-                    category,
-                    facts,
-                    source_thread_id=thread_id,
-                )
-    except Exception as e:
-        print(f"[memory] 长期记忆提取失败: {e}")
-    return {}
-
-
 def act_node(state: ReActState) -> dict:
     """
-    Act 节点：执行所有待处理的工具调用
+    Act 节点：执行所有待处理的工具调用。
 
-    输入: state["tool_calls"]
-    输出: 工具执行结果追加到 messages
+    接收：ReActState
+    返回：{"messages": [ToolMessage, ...]}
     """
     results = []
     for call in state["tool_calls"]:
@@ -179,93 +73,63 @@ def act_node(state: ReActState) -> dict:
 
 def observe_node(state: ReActState) -> dict:
     """
-    Observe 节点：记录本轮观察结果，递增循环计数
+    Observe 节点：记录本轮观察结果，递增循环计数。
 
-    这个节点很轻量，主要用于：
-    1. 更新 iteration 计数
-    2. 为未来扩展留位置（日志、反思等）
+    接收：ReActState
+    返回：{"iteration": state["iteration"] + 1}
     """
     return {
         "iteration": state["iteration"] + 1,
     }
 
 
-# ============================================================
-# 3. 条件边函数
-#    决定循环是继续还是结束
-# ============================================================
-
 def should_continue(state: ReActState) -> str:
     """
-    条件判断：AI 请求了工具 → 继续循环，否则结束
+    条件判断：AI 请求了工具 → 继续循环，否则结束。
 
-    返回值对应 conditional_edges 的映射键
+    接收：ReActState
+    返回："act" 或 "end"
     """
     if state["should_act"]:
         return "act"
     return "end"
-    #这里返回的是节点的名称，不是节点实例
 
 
-# ============================================================
-# 4. 构建图
-# ============================================================
-
-MAX_ITERATIONS = 35  # 最大循环次数（防止无限循环）
-MEMORY_WINDOW = 20  # 送入 LLM 的最近消息条数
-
-_memory_db_path = DEFAULT_DB_PATH
-_memory_db_path.parent.mkdir(parents=True, exist_ok=True)
-_checkpointer_conn = sqlite3.connect(str(_memory_db_path), check_same_thread=False)
-_checkpointer = SqliteSaver(_checkpointer_conn)
-_memory_store = LongTermMemoryStore(_memory_db_path)
+MAX_ITERATIONS = 35
+MEMORY_WINDOW = 20
 
 
-def get_checkpointer():
-    """返回当前进程共享的 SQLite checkpointer。"""
-    return _checkpointer
-
-
-def get_memory_store():
-    """返回项目级长期记忆 Store。"""
-    return _memory_store
-
-
-def build_graph(provider: str = "anthropic"):
+def build_graph(
+    provider: str,
+    *,
+    checkpointer,
+    memory_store,
+):
     """
-    构建并编译 ReAct Agent 图
+    显式组装并编译 ReAct Agent 图。
 
-    Args:
-        provider: LLM 提供商，"anthropic" / "openai" / "ollama"
-
-    Returns:
-        编译后的 LangGraph app，可直接 .invoke() 调用
+    接收：
+        provider：LLM 提供商
+        checkpointer：LangGraph checkpointer
+        memory_store：长期记忆 Store
+    返回：编译后的 LangGraph app
     """
-    # 初始化 LLM
     llm = get_llm(provider)
-
-    # 绑定工具到 LLM,形成一个新llm实例
     llm_with_tools = llm.bind_tools(TOOLS)
 
-    # 创建状态图
     graph = StateGraph(ReActState)
-
-    # 添加节点（lambda 包装用于注入 llm_with_tools / llm / memory_store）
     graph.add_node(
         "think",
-        lambda state: think_node(state, llm_with_tools, llm, _memory_store),
+        lambda state: think_node(state, llm_with_tools, llm, memory_store),
     )
     graph.add_node("act", act_node)
     graph.add_node("observe", observe_node)
     graph.add_node(
         "extract",
-        lambda state: extract_node(state, llm, _memory_store),
+        lambda state: extract_memory_facts(state, llm, memory_store),
     )
 
-    # 设置入口
     graph.set_entry_point("think")
-
-    # 添加条件边：think → 需要行动? → act 或 extract
     graph.add_conditional_edges(
         "think",
         should_continue,
@@ -273,13 +137,9 @@ def build_graph(provider: str = "anthropic"):
             "act": "act",
             "end": "extract",
         },
-    )#左边是should_continue返回的字符串，右边是节点名称
-    
-    # 添加普通边：act → observe → think（形成循环）
+    )
     graph.add_edge("act", "observe")
     graph.add_edge("observe", "think")
     graph.add_edge("extract", END)
 
-    # 编译图
-    app = graph.compile(checkpointer=_checkpointer)
-    return app
+    return graph.compile(checkpointer=checkpointer)

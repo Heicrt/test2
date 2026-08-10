@@ -11,7 +11,8 @@ import sys
 from langchain_core.messages import HumanMessage
 
 # 环境变量由 config.py 在导入 test2.graph 时从项目根目录统一加载
-from test2.graph import build_graph, MAX_ITERATIONS, get_checkpointer
+from test2.graph import MAX_ITERATIONS
+from test2.runtime import create_runtime
 
 THREAD_ID = "cli-default"
 
@@ -60,9 +61,10 @@ def main():
 
     print(f"⏳ 正在初始化 ReAct Agent (provider: {provider}, model: {model or '自动'})...")
 
-    # 构建图
+    # 构建运行时
     try:
-        app = build_graph(provider)
+        runtime = create_runtime(provider)
+        app = runtime.app
     except Exception as e:
         print(f"❌ 初始化失败: {e}")
         print("   请检查 .env 文件中的 LLM_PROVIDER / LLM_MODEL / LLM_API_KEY 配置")
@@ -89,7 +91,7 @@ def main():
             print("👋 再见！")
             break
         if user_input.lower() in ("clear", "/clear"):
-            get_checkpointer().delete_thread(THREAD_ID)
+            runtime.checkpointer.delete_thread(THREAD_ID)
             print("\n🧹 已清空当前会话记忆")
             continue
 

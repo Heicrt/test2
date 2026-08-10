@@ -21,7 +21,8 @@ from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import HumanMessage
 
 # 环境变量由 config.py 在导入 test2.graph 时从项目根目录统一加载
-from test2.graph import build_graph, MAX_ITERATIONS, get_checkpointer
+from test2.graph import MAX_ITERATIONS
+from test2.runtime import create_runtime
 
 # 本文件所在目录（static 与此同级）
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -31,15 +32,19 @@ app = FastAPI(title="test2 ReAct 可视化")
 
 # Agent 懒加载：首次请求时才构建。
 # 这样即使 .env 未配置 API Key，页面也能打开，并在请求时返回友好错误而非启动即 500。
-_agent = None
+_runtime = None
+
+
+def get_runtime():
+    global _runtime
+    if _runtime is None:
+        provider = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
+        _runtime = create_runtime(provider)
+    return _runtime
 
 
 def get_agent():
-    global _agent
-    if _agent is None:
-        provider = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
-        _agent = build_graph(provider)
-    return _agent
+    return get_runtime().app
 
 
 def sse(event: str, data: dict) -> str:
@@ -138,7 +143,7 @@ async def chat(request: Request):
 async def clear_session(request: Request):
     body = await request.json()
     session_id = str(body.get("session_id") or "default").strip() or "default"
-    get_checkpointer().delete_thread(session_id)
+    get_runtime().checkpointer.delete_thread(session_id)
     return {"ok": True}
 
 
