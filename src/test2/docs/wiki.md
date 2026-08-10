@@ -616,36 +616,7 @@ with open(PRESETS_PATH, "rb") as f:
 <a id="func-config-get_llm"></a>
 #### 4.1.1 get_llm
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `provider` | `str \| None` | 可选，默认从 `LLM_PROVIDER` 读取 | `build_graph()` 显式传入，或由调用方省略 | 必须是 `providers.toml` 中的 key；不传或环境变量为空会抛 `ValueError` | `"anthropic"` |
-| `temperature` | `float \| None` | 可选，默认从 `LLM_TEMPERATURE` 读取，兜底 `0` | `build_graph()` 通常省略，由环境变量决定 | 传给 ChatModel 的温度参数；非数值字符串会在转换时抛 `ValueError` | `0.2` |
-
-**参数详解**
-
-`provider` 决定使用哪一家 LLM 供应商，是配置查询的入口；它不仅是字符串，还对应 `providers.toml` 中一个包含 `protocol`、`base_url`、`models` 的预设字典。本函数会读取它来查表，并决定创建 `ChatAnthropic` 还是 `ChatOpenAI`；最终创建的模型对象会由 `build_graph()` 继续绑定工具并注入图节点。如果调用方没有传值，本函数会回退到环境变量 `LLM_PROVIDER`，这保证了 CLI/Web 只需配置 `.env` 就能切换供应商。
-
-`temperature` 控制 LLM 输出随机性，是模型创建时的业务参数；它不参与工具选择逻辑，但会直接影响回答风格和稳定性。本函数只在创建 ChatModel 时消费它，之后不再保存或传递；调用方通常不直接传值，而是依赖 `.env` 中的 `LLM_TEMPERATURE`。该参数缺省时按 `0` 处理，便于复现稳定输出。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 示例 |
-| --- | --- | --- | --- |
-| LLM 实例 | `ChatAnthropic` / `ChatOpenAI` | 根据 `protocol` 决定 | `ChatOpenAI(model="gpt-4o", ...)` |
-
-**返回详解**
-
-返回的是可调用的 LangChain ChatModel 实例，不是字符串或图对象；它由 `build_graph()` 使用，并继续派生出 `llm_with_tools = llm.bind_tools(TOOLS)`。该实例负责最终和真实供应商通信，因此后续任何 LLM 调用失败都发生在模型请求阶段。`protocol == "anthropic"` 返回 `ChatAnthropic`，其余走 OpenAI 兼容协议返回 `ChatOpenAI`；两个实例对图节点来说是同一个“能调用 `.invoke()` 的模型”抽象。
-
-**作用**
-
-```text
-根据 provider 查表，按 protocol 创建对应 ChatModel
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def get_llm(provider: str | None = None, temperature: float | None = None):
@@ -660,12 +631,16 @@ def get_llm(provider: str | None = None, temperature: float | None = None):
         LangChain ChatModel 实例
     """
     # 从环境变量读取
+    # 优先使用显式 provider，没传就从 .env 读取 LLM_PROVIDER，并统一小写
     provider = (provider or os.getenv("LLM_PROVIDER", "")).strip().lower()
+    # 读取模型名，为空时后面会用预设表第一个模型兜底
     model = os.getenv("LLM_MODEL", "").strip()
+    # 读取统一 API Key，Anthropic 有 key 才显式传，OpenAI 用 placeholder 占位
     api_key = os.getenv("LLM_API_KEY", "").strip()
     if temperature is None:
         temperature = float(os.getenv("LLM_TEMPERATURE", "0"))
 
+    # provider 为空说明用户没有配置供应商，直接报错并列出支持列表
     if not provider:
         raise ValueError(
             "未设置 LLM_PROVIDER，请在 .env 中设置，例如:\n"
@@ -674,8 +649,10 @@ def get_llm(provider: str | None = None, temperature: float | None = None):
         )
 
     # 查表
+    # 用 provider 查 providers.toml，得到协议、base_url、models
     preset = PRESETS.get(provider)
     #preset 是一个字典，包含了该供应商协议、 URL 和模型列表
+    # 查不到预设说明配置名写错，抛出带支持列表的错误
     if not preset:
         raise ValueError(
             f"未知的 LLM_PROVIDER: '{provider}'\n"
@@ -683,21 +660,25 @@ def get_llm(provider: str | None = None, temperature: float | None = None):
             f"请在 .env 中设置 LLM_PROVIDER=上述之一"
         )
 
+    # 读取该供应商走的协议，默认 openai
     protocol = preset.get("protocol", "openai")
 
     # Anthropic 协议：用 ChatAnthropic
+    # Anthropic 走原生 ChatAnthropic
     if protocol == "anthropic":
         from langchain_anthropic import ChatAnthropic
         kwargs: dict = {
             "model": model or preset.get("models", [""])[0],
             "temperature": temperature,
         }
+        # 有 LLM_API_KEY 才显式传，否则交给 ChatAnthropic 回退 ANTHROPIC_API_KEY，避免 pydantic 校验失败
         if api_key:
             kwargs["api_key"] = api_key
         return ChatAnthropic(**kwargs)
     #有自定义密钥就手动传入，没有就不填密钥参数，交给框架自动读取环境变量
 
     # OpenAI 协议：用 ChatOpenAI（覆盖绝大多数供应商）
+    # OpenAI 兼容供应商统一走 ChatOpenAI，只改 base_url 和模型
     if protocol == "openai":
         from langchain_openai import ChatOpenAI
         base_url = preset.get("base_url") or os.getenv("LLM_BASE_URL", "")
@@ -708,22 +689,32 @@ def get_llm(provider: str | None = None, temperature: float | None = None):
             temperature=temperature,
         )
 
+    # 协议既不是 anthropic 也不是 openai，直接拒绝
     raise ValueError(f"不支持的协议: {protocol}")
 ```
 
-**调用链**
+**参数**
 
-```text
-build_graph() -> get_llm(provider)
-```
+- `provider`: 供应商名，可选，默认读 `LLM_PROVIDER`；必须存在于 `providers.toml`。
+- `temperature`: 温度参数，可选，默认读 `LLM_TEMPERATURE`，兜底 0。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. provider 为空或未设置 -> ValueError，提示 LLM_PROVIDER 未配置。
-2. provider 不在 PRESETS -> ValueError，列出支持列表。
-3. protocol 不是 anthropic/openai -> ValueError。
-4. openai 协议没有 key -> 使用 "placeholder"，认证错误延迟到真实请求阶段。
+正常路径是 provider 存在且 protocol 是 anthropic/openai；异常路径是 provider 缺失或不存在。
+
+**数据流举例**
+
+provider -> PRESETS 查表 -> protocol -> ChatAnthropic/ChatOpenAI -> 返回 ChatModel。
+
+**关键点与边界**
+
+不直接请求模型；OpenAI 无 key 时用 placeholder，认证错误延迟到调用阶段。
+
+**伪代码调用示例**
+
+```python
+llm = get_llm("ollama")
+# 返回 ChatOpenAI 兼容实例
 ```
 
 <a id="module-tools"></a>
@@ -734,33 +725,7 @@ build_graph() -> get_llm(provider)
 <a id="func-tools-calculator"></a>
 #### 4.2.1 calculator
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `expression` | `str` | 必填，无默认 | `act_node` 从 `tool_call["args"]["expression"]` 传入 | 必须是可被受限 `eval()` 解析的表达式；空字符串或未知函数返回错误文本 | `"2 + 3 * 4"` |
-
-**参数详解**
-
-`expression` 是 LLM 决定要计算的数学表达式，代表一个需要由本地工具完成的数值任务。它通常由 `act_node` 从 `tool_calls` 中的 `args` 字段取出，不是用户直接传入的原始字符串。本函数会在一个没有 `__builtins__` 的安全命名空间里求值，因此它只能使用白名单内的数学函数和常量。这个参数决定最终是返回计算结果还是返回错误说明，而错误说明也会作为工具结果继续交给 LLM 分析。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 示例 |
-| --- | --- | --- | --- |
-| 计算结果 | `str` | 数字文本或错误文本 | `"14"`、`"计算错误: name 'x' is not defined"` |
-
-**返回详解**
-
-返回永远是字符串，因为 `act_node` 需要把它包装成 `ToolMessage(content=...)`，而 ToolMessage 的内容是 LLM 后续可读的文本。成功时返回数字字符串，失败时返回包含原因的字符串；两者都会被当成正常工具结果，不会中断整张图。这个返回值最终会进入消息历史，供下一轮 `think_node` 判断是否还需要继续行动。
-
-**作用**
-
-```text
-在受限数学命名空间中计算表达式，禁止任意 Python 代码执行
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 @tool
@@ -771,6 +736,7 @@ def calculator(expression: str) -> str:
     示例: "2 + 3 * 4", "sqrt(16)", "sin(pi/2)", "2**10"
     """
     # 安全的数学环境，禁止任意代码执行
+    # 构造白名单命名空间，禁止 __import__ 等危险能力
     safe_ns = {
         "__builtins__": {},
         "sqrt": math.sqrt,
@@ -785,56 +751,44 @@ def calculator(expression: str) -> str:
         "pi": math.pi,
         "e": math.e,
     }
+    # 计算可能失败，必须捕获语法错误、数学错误和任意异常
     try:
+        # 只在 safe_ns 里 eval，因此表达式只能用白名单函数和常量
         result = eval(expression, safe_ns)
+        # 返回字符串，方便 act_node 直接包成 ToolMessage
         return str(result)
+    # 任何异常都转成可读文本，不让工具执行炸掉整张图
     except Exception as ex:
         return f"计算错误: {ex}"
 ```
 
-**调用链**
+**参数**
 
-```text
-act_node -> TOOL_MAP["calculator"].invoke(tool_args)
-```
+- `expression`: 数学表达式字符串，由 act_node 从 tool_call.args 传入。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. __builtins__ 置空，屏蔽 __import__ 等危险入口。
-2. 表达式语法错误或执行异常 -> 返回 "计算错误: ..."。
+正常：表达式在白名单命名空间可求值，返回数字字符串；失败：语法错误或数学错误，返回错误文本。
+
+**数据流举例**
+
+expression -> safe_ns eval -> str(result) -> act_node 包成 ToolMessage。
+
+**关键点与边界**
+
+`__builtins__` 置空，禁止危险代码执行；错误不抛给图。
+
+**伪代码调用示例**
+
+```python
+calculator("2 + 3 * 4")
+# 返回 "14"
 ```
 
 <a id="func-tools-weather"></a>
 #### 4.2.2 weather
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `city` | `str` | 必填，无默认 | `act_node` 从 `tool_call["args"]["city"]` 传入 | 必须是城市名称字符串；空字符串或查不到城市返回失败文本 | `"北京"` |
-
-**参数详解**
-
-`city` 是用户或 LLM 给出的城市名，代表一次实时天气查询的目标。它不是结构化 LocationID，需要先通过和风天气的城市搜索接口转换成 `city_id`，再查询实时天气。本函数会把 `city` 放到地理编码接口的 `location` 参数中，因此它必须匹配和风天气可识别的城市名称。查询结果会格式化成一整段中文天气文本，最终由 `act_node` 包装成 `ToolMessage` 放回消息历史，供下一轮 `think_node` 读取。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 示例 |
-| --- | --- | --- | --- |
-| 天气结果 | `str` | 成功天气文本或失败原因 | `"北京：晴，气温 25°C..."` |
-
-**返回详解**
-
-返回的是可直接给 LLM 阅读的天气结果，而不是结构化 JSON。成功时包含省份/城市、天气现象、气温、体感温度、湿度和风向风力；失败时包含具体原因，例如未配置 API、城市未找到、网络错误或数据解析错误。该返回值会成为 `ToolMessage` 的 `content`，所以失败文本也会被当作工具观察结果继续参与 ReAct 循环。
-
-**作用**
-
-```text
-调用和风天气 API，先城市搜索，再查询实时天气
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 @tool
@@ -844,20 +798,23 @@ def weather(city: str) -> str:
     Args:
         city: 城市名称，如 "北京"、"上海"、"深圳"
     """
+    # 读取和风天气 API 域名与密钥，缺配置直接返回失败文本
     api_host = os.getenv("QWEATHER_API_HOST")
     api_key = os.getenv("QWEATHER_API_KEY")
     if not api_host or not api_key:
         return "天气查询失败：未配置 QWEATHER_API_HOST 或 QWEATHER_API_KEY"
 
+    # 构造 API 鉴权头，和风天气使用 X-QW-Api-Key
     headers = {"X-QW-Api-Key": api_key}
 
     try:
         # 1. 城市搜索：中文名 → LocationID
         geo_url = f"https://{api_host}/geo/v2/city/lookup"
         #requests.get() 方法用于向指定的 URL 发送 GET 请求，并返回一个 Response 对象。
+        # 第一步：用城市中文名请求地理编码接口，换回 LocationID
         geo_resp = requests.get(geo_url, params={"location": city, "range": "cn", "number": 1}, headers=headers, timeout=5)
-
         geo_data = geo_resp.json()
+        # 城市搜索失败时直接返回用户可读错误
         if geo_data.get("code") != "200" or not geo_data.get("location"):
             return f"未找到城市「{city}」，请检查城市名称"
         city_info = geo_data["location"][0]
@@ -867,12 +824,15 @@ def weather(city: str) -> str:
 
         # 2. 实时天气
         weather_url = f"https://{api_host}/v7/weather/now"
+        # 第二步：用 LocationID 请求实时天气接口
         weather_resp = requests.get(weather_url, params={"location": city_id, "lang": "zh"}, headers=headers, timeout=5)
         data = weather_resp.json()
+        # 天气接口返回错误码时直接返回失败原因
         if data.get("code") != "200":
             return f"天气查询失败：API 返回错误码 {data.get('code')}"
 
         now = data["now"]
+        # 把天气字段拼成完整中文文本，LLM 后续可直接阅读
         return (
             f"{adm} {city_name}：{now['text']}，"
             f"气温 {now['temp']}°C，体感 {now['feelsLike']}°C，"
@@ -887,17 +847,27 @@ def weather(city: str) -> str:
         return f"天气数据解析错误：{e}"
 ```
 
-**调用链**
+**参数**
 
-```text
-act_node -> TOOL_MAP["weather"].invoke({"city": city})
-```
+- `city`: 城市名称字符串，由 act_node 从 tool_call.args 传入。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. 未配置 QWEATHER_API_HOST/QWEATHER_API_KEY -> 返回失败文本。
-2. 网络超时、网络错误、JSON 字段缺失 -> 转成字符串，不抛给图。
+正常：城市搜索成功并返回实时天气；失败：缺配置、未找到城市、网络或解析错误。
+
+**数据流举例**
+
+city -> 地理编码 API -> LocationID -> 实时天气 API -> 中文天气文本。
+
+**关键点与边界**
+
+不抛异常，所有失败都转成字符串，作为工具结果交给 LLM。
+
+**伪代码调用示例**
+
+```python
+weather("北京")
+# 返回 "北京：晴，气温 25°C..."
 ```
 
 <a id="module-state"></a>
@@ -908,84 +878,43 @@ act_node -> TOOL_MAP["weather"].invoke({"city": city})
 <a id="func-state-keep_existing_summary"></a>
 #### 4.3.1 keep_existing_summary
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `old_value` | `str` | 必填，无默认 | LangGraph checkpoint 中已有的 `summary` | 任意字符串；通常为空或旧摘要 | `"用户喜欢简洁回答"` |
-| `new_value` | `str` | 必填，无默认 | 当前节点返回的 `summary` | 任意字符串；空字符串不会覆盖旧值 | `""` |
-
-**参数详解**
-
-`old_value` 是当前会话已经保存的摘要，代表之前几轮对话被压缩后的长期上下文。LangGraph 在合并状态时会先把旧值传进来，本函数需要决定是保留它还是被新摘要替换。`new_value` 是当前节点想写入的新摘要，正常情况下来自 `prepare_conversation()`；如果本轮没有触发摘要，`think_node` 返回的 `summary` 就是旧值或空字符串。这个 reducer 的核心作用是防止 `initial_state()` 里的 `summary: ""` 每次清空已生成摘要。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 示例 |
-| --- | --- | --- | --- |
-| 最终摘要 | `str` | `new_value` 或 `old_value` | `"用户喜欢简洁回答"` |
-
-**返回详解**
-
-返回的是合并后的 `summary`，会被 LangGraph 写回状态，供后续 `think_node` 和 `extract_node` 读取。非空 `new_value` 表示有新的动态摘要，因此优先使用；空 `new_value` 表示本轮没有新摘要，必须保留旧值。这个返回值直接影响 LLM 输入中的会话摘要段，不能因为每轮初始状态而丢失。
-
-**作用**
-
-```text
-作为 summary 字段的 reducer，空字符串不覆盖已有摘要
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def keep_existing_summary(old_value: str, new_value: str) -> str:
     """空字符串不覆盖已有摘要，避免每次调用初始状态清空 summary。"""
+    # 新摘要非空就用新摘要，空字符串保留旧摘要，避免初始 state 清空记忆
     return new_value if new_value else old_value
 ```
 
-**调用链**
+**参数**
 
-```text
-LangGraph 在合并 ReActState.summary 时调用
-```
+- `old_value`: 旧 summary。
+- `new_value`: 节点返回的新 summary。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. 参数类型不是 str 时可能触发类型错误，当前调用链保证传入 str。
-2. 没有异常分支；即使两个值都为空，也会返回空字符串。
+正常：新值非空，使用新值；边界：新值为空，保留旧值。
+
+**数据流举例**
+
+old_value + new_value -> 非空判断 -> 最终 summary。
+
+**关键点与边界**
+
+防止 initial_state 的空 summary 覆盖已有摘要。
+
+**伪代码调用示例**
+
+```python
+keep_existing_summary("旧摘要", "")
+# 返回 "旧摘要"
 ```
 
 <a id="class-state-react_state"></a>
 #### 4.3.2 ReActState
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| 无构造参数 | - | - | 类型定义，不直接实例化 | LangGraph 按字段合并状态 | - |
-
-**参数详解**
-
-`ReActState` 不是普通数据类，而是 LangGraph 用来描述全局状态的类型；它本身没有构造参数，LangGraph 节点通过返回 `dict` 增量更新字段。字段含义在 [4.0.1 ReActState](#contract-react-state) 已定义，本类只是把这些字段绑定到状态图上。`messages` 决定 LLM 历史，`summary` 决定压缩后的长期上下文，`should_act`/`tool_calls` 驱动工具循环，`iteration` 记录轮数。所有节点都会读取这个状态的某一部分，并通过返回 dict 修改它。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 示例 |
-| --- | --- | --- | --- |
-| 状态结构 | `ReActState` | 包含 `messages`、`summary`、`should_act`、`tool_calls`、`iteration` 的 TypedDict 形态 | 见 [4.0.1](#contract-react-state) |
-
-**返回详解**
-
-这里“返回”不是函数返回值，而是 `StateGraph(ReActState)` 最终维护的状态形态。`messages` 由 `add_messages` 自动合并，`summary` 由 `keep_existing_summary` 合并，其余普通字段由节点直接覆盖。这个状态会被 `think_node`、`act_node`、`observe_node`、`extract_node` 和条件边读取；理解它就是理解整张图的数据契约。
-
-**作用**
-
-```text
-定义 ReAct 循环的全局状态
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 class ReActState(MessagesState):
@@ -1001,19 +930,27 @@ class ReActState(MessagesState):
     iteration: int
 ```
 
-**调用链**
+**参数**
 
-```text
-build_graph() -> StateGraph(ReActState)
-agent_session.initial_state() -> 构造初始 state
-```
+无构造参数，是 LangGraph State 类型。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. 节点返回未声明字段时，LangGraph 可能忽略或按 extra 行为处理。
-2. messages 缺少 reducer 语义时会覆盖历史，当前由 MessagesState 避免。
-3. thought 不是正式字段，但仍作为历史遗留初始值传入。
+被 StateGraph 使用；节点通过返回 dict 更新字段。
+
+**数据流举例**
+
+initial_state -> LangGraph 节点增量更新 -> 最终状态。
+
+**关键点与边界**
+
+字段形状见 4.0.1；messages 用 add_messages，summary 用 keep_existing_summary。
+
+**伪代码调用示例**
+
+```python
+state = initial_state("你好")
+# 得到完整 ReActState 初始值
 ```
 
 <a id="module-graph"></a>
@@ -1031,44 +968,7 @@ MEMORY_WINDOW = 20
 <a id="func-graph-think_node"></a>
 #### 4.4.1 think_node
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `state` | `ReActState` | 必填，无默认 | LangGraph 节点框架自动传入 | 必须包含 `messages`；缺 `messages` 会 `KeyError` | 见 [4.0.1](#contract-react-state) |
-| `llm_with_tools` | LangChain ChatModel 对象 | 必填，无默认 | `build_graph()` 创建并闭包注入 | 必须有 `.invoke()`；返回对象需有 `.content`/`.tool_calls` | `llm.bind_tools(TOOLS)` |
-| `llm` | LangChain ChatModel 对象 | 必填，无默认 | `build_graph()` 创建并闭包注入 | 必须能被 `prepare_conversation()` 调用 | `get_llm("anthropic")` |
-| `memory_store` | `MemoryStore` | 必填，无默认 | `create_runtime()` 创建，`build_graph()` 注入 | 必须实现 `get_memory_context()` / `merge_facts()` | `LongTermMemoryStore("data/memory.db")` |
-
-**参数详解**
-
-`state` 是当前会话的完整状态，代表 LLM 在这一轮能看到的历史、摘要、工具调用标志和轮数。本函数会读取 `state["messages"]` 交给记忆工具做窗口裁剪和摘要准备，但不会直接修改它；修改通过返回 `messages` 增量由 `add_messages` 完成。这个参数是 LangGraph 节点之间的数据载体，后续 `act_node` 和条件边会消费本函数写出的 `should_act` 与 `tool_calls`。
-
-`llm_with_tools` 是已经绑定工具的 LLM，代表“既能对话又能请求工具”的模型入口。本函数调用它的 `.invoke()` 获取 `AIMessage`，通过 `tool_calls` 判断是否继续 ReAct 循环。它由 `build_graph()` 闭包注入，因此 LangGraph 调用节点时只需要传入 `state`。`llm` 是同一个供应商的原始模型，不绑定工具，专门用于摘要生成；它保证摘要 prompt 不会意外触发工具调用。
-
-`memory_store` 是项目级长期记忆的访问入口，本函数把它传给 `compose_llm_input()`，用于在最终 LLM 输入最前面插入项目长期记忆。当前实现从 SQLite 读取已保存的用户偏好和项目事实；如果读取结果为空，就不会生成长期记忆 `SystemMessage`。
-
-**快速返回表**
-
-| 字段 | 类型 | 是否总是返回 | 含义 | 示例 |
-| --- | --- | --- | --- | --- |
-| `messages` | `list` | 是 | `removals + [response]`，交给 `add_messages` | `[RemoveMessage(...), AIMessage(...)]` |
-| `thought` | `str` | 是 | AI 思考内容，无内容时使用占位文本 | `"我需要查询天气"` |
-| `should_act` | `bool` | 是 | 是否有工具调用 | `True` |
-| `tool_calls` | `list[dict]` | 是 | 本轮工具调用，无调用时为空数组 | `[{"name":"weather",...}]` |
-| `summary` | `str` | 是 | 当前会话摘要 | `""` |
-
-**返回详解**
-
-返回的 `messages` 是 LangGraph 会合并进历史的消息增量，包含可能的 `RemoveMessage` 和本轮 `AIMessage`；它的消费方是 `add_messages` reducer，而不是调用者直接读取。`should_act` 和 `tool_calls` 是驱动流程的核心：条件边读取 `should_act`，`act_node` 读取 `tool_calls`。`summary` 由 `keep_existing_summary` 合并，空字符串不会覆盖旧摘要。这个返回 dict 让 LangGraph 知道下一轮该进入 `act` 还是结束。
-
-**作用**
-
-```text
-准备 LLM 输入，调用带工具 LLM，判断是否请求工具
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def think_node(state: ReActState, llm_with_tools, llm, memory_store) -> dict:
@@ -1078,18 +978,23 @@ def think_node(state: ReActState, llm_with_tools, llm, memory_store) -> dict:
     接收：ReActState、绑定工具的 LLM、原始 LLM、长期记忆 Store
     返回：本轮状态更新 dict
     """
+    # 先让记忆工具决定：给 LLM 看哪些最近消息、是否生成摘要、要删除哪些旧消息
     summary, recent_history, removals = prepare_conversation(
         state,
         llm,
         MEMORY_WINDOW,
     )
+    # 按 长期记忆 -> 摘要 -> 最近消息 的顺序组装最终 LLM 输入
     llm_input = compose_llm_input(memory_store, summary, recent_history)
 
+    # 调用绑定工具的 LLM，让它决定本轮是回答还是请求工具
     response = llm_with_tools.invoke(llm_input)
 
     # 判断 AI 是否请求了工具调用
+    # 有没有 tool_calls 是 ReAct 是否继续循环的开关
     has_tool_calls = bool(response.tool_calls)
 
+    # 返回增量状态：消息交给 add_messages，should_act 交给条件边
     return {
         "messages": removals + [response],
         "thought": response.content or "(AI 请求调用工具)",
@@ -1099,54 +1004,36 @@ def think_node(state: ReActState, llm_with_tools, llm, memory_store) -> dict:
     }
 ```
 
-**调用链**
+**参数**
 
-```text
-LangGraph think 节点
-  -> prepare_conversation()
-  -> compose_llm_input()
-  -> llm_with_tools.invoke()
-```
+- `state`: ReActState，LangGraph 自动传入。
+- `llm_with_tools`: 绑定工具模型。
+- `llm`: 原始模型。
+- `memory_store`: MemoryStore。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. state 缺少 messages -> KeyError。
-2. memory_store 不满足 MemoryStore 接口 -> AttributeError。
-3. llm_with_tools.invoke() 抛异常 -> 向上传播，由 app.stream 调用方处理。
-4. LLM 返回空 tool_calls -> should_act=False，正常结束循环。
+正常：模型返回最终回复；循环：模型返回 tool_calls，进入 act。
+
+**数据流举例**
+
+state -> prepare_conversation -> compose_llm_input -> llm_with_tools.invoke -> 返回 messages/should_act/tool_calls/summary。
+
+**关键点与边界**
+
+removals 只在摘要触发时非空；should_act 驱动条件边。
+
+**伪代码调用示例**
+
+```python
+think_node(state, llm_with_tools, llm, store)
+# 返回本轮状态更新 dict
 ```
 
 <a id="func-graph-act_node"></a>
 #### 4.4.2 act_node
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `state` | `ReActState` | 必填，无默认 | LangGraph 节点框架自动传入 | 必须包含 `tool_calls`；缺少时 `KeyError` | 见 [4.0.1](#contract-react-state) |
-
-**参数详解**
-
-`state` 是当前全局状态，本函数只关心其中的 `tool_calls` 字段，它代表 LLM 上一轮请求执行的工具列表。`tool_calls` 中的每个元素必须符合 [4.0.2 tool_call](#contract-tool-call) 的形状，包含 `name`、`args`、`id`。本函数不会读取 `messages` 或 `summary`，只会把工具执行结果包装成 `ToolMessage` 返回；这些消息随后由 `add_messages` 拼入历史，供下一轮 `think_node` 观察。
-
-**快速返回表**
-
-| 字段 | 类型 | 是否总是返回 | 含义 | 示例 |
-| --- | --- | --- | --- | --- |
-| `messages` | `list[ToolMessage]` | 是 | 所有工具执行结果 | `[ToolMessage(content="晴 25°C", tool_call_id="call_abc")]` |
-
-**返回详解**
-
-返回值是一个只包含 `messages` 的 dict，代表本轮新增的工具结果。每个 `ToolMessage` 的 `tool_call_id` 必须对应 `tool_calls` 中某次调用的 `id`，否则 LLM 无法把结果关联到正确调用。该列表会通过 `add_messages` 追加到历史，随后 `observe_node` 递增 `iteration`，再回到 `think_node`。
-
-**作用**
-
-```text
-执行 state["tool_calls"] 中的每个工具调用
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def act_node(state: ReActState) -> dict:
@@ -1156,73 +1043,63 @@ def act_node(state: ReActState) -> dict:
     接收：ReActState
     返回：{"messages": [ToolMessage, ...]}
     """
+    # 准备收集所有工具结果
     results = []
+    # 遍历 LLM 本轮请求的每一个工具调用
     for call in state["tool_calls"]:
         tool_name = call["name"]
         tool_args = call["args"]
 
         # 查找并执行工具
+        # 按工具名查 TOOL_MAP，查不到就是未知工具
         tool = TOOL_MAP.get(tool_name)
+        # 未知工具也返回 ToolMessage，让 LLM 知道发生了什么
         if tool is None:
             content = f"错误：未知工具 '{tool_name}'"
         else:
             try:
+                # 调用真实工具，工具异常会被包成文本
                 content = tool.invoke(tool_args)
             except Exception as e:
                 content = f"工具执行失败: {e}"
 
         # 构造 ToolMessage（LangChain 要求的格式）
+        # 每个工具结果必须关联原 tool_call_id，否则 LLM 无法对应
         results.append(
             ToolMessage(content=str(content), tool_call_id=call["id"])
         )
 
+    # 只返回本轮新增 ToolMessage，由 add_messages 合并历史
     return {"messages": results}
 ```
 
-**调用链**
+**参数**
 
-```text
-should_continue() -> "act" -> act_node
-```
+- `state`: ReActState，必须包含 tool_calls。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. 未知工具 -> 返回错误文本 ToolMessage。
-2. 工具抛异常 -> 转为 ToolMessage，不中断整张图。
-3. ToolMessage.tool_call_id 与 tool_call.id 不匹配时，LLM 可能无法正确理解结果。
+正常：执行所有工具并返回 ToolMessage；边界：未知工具或工具异常。
+
+**数据流举例**
+
+state.tool_calls -> TOOL_MAP 查工具 -> tool.invoke -> ToolMessage。
+
+**关键点与边界**
+
+tool_call_id 必须对应 AIMessage 的 tool_call.id。
+
+**伪代码调用示例**
+
+```python
+act_node(state)
+# 返回 {"messages": [ToolMessage(...)]}
 ```
 
 <a id="func-graph-observe_node"></a>
 #### 4.4.3 observe_node
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `state` | `ReActState` | 必填，无默认 | LangGraph 节点框架自动传入 | 必须包含 `iteration`；缺少时 `KeyError` | `{"iteration": 0, ...}` |
-
-**参数详解**
-
-`state` 是当前全局状态，本函数只读取 `iteration`，它表示此前已经完成多少轮工具执行。该字段由初始 state 从 `0` 开始，每经过一次 `act -> observe` 递增一次。本函数不处理消息历史，也不做业务判断，只负责记录“本轮工具已经执行完”这一事件。递增后的值会返回给 LangGraph，最终可用于日志统计或递归保护。
-
-**快速返回表**
-
-| 字段 | 类型 | 是否总是返回 | 含义 | 示例 |
-| --- | --- | --- | --- | --- |
-| `iteration` | `int` | 是 | 执行轮数加一 | `1` |
-
-**返回详解**
-
-返回的 `iteration` 是新的轮数，会被 LangGraph 直接覆盖到状态中。它不是消息，不进入 `messages`，因此 CLI 和 Web 都通过观察 `observe` 节点更新来统计轮数。这个值只增不减，不能用来删除或修改历史消息。
-
-**作用**
-
-```text
-记录一轮工具执行完成，递增循环计数
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def observe_node(state: ReActState) -> dict:
@@ -1232,54 +1109,39 @@ def observe_node(state: ReActState) -> dict:
     接收：ReActState
     返回：{"iteration": state["iteration"] + 1}
     """
+    # 只递增 iteration，表示完成一轮 act->observe
     return {
         "iteration": state["iteration"] + 1,
     }
 ```
 
-**调用链**
+**参数**
 
-```text
-act -> observe -> think
-```
+- `state`: ReActState，必须包含 iteration。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. state 缺少 iteration -> KeyError。
-2. iteration 不是数值 -> TypeError。
+每经过一次 act->observe 都会递增。
+
+**数据流举例**
+
+iteration -> iteration + 1 -> 覆盖状态。
+
+**关键点与边界**
+
+不修改 messages，只记录轮数。
+
+**伪代码调用示例**
+
+```python
+observe_node({"iteration": 1})
+# 返回 {"iteration": 2}
 ```
 
 <a id="func-graph-should_continue"></a>
 #### 4.4.4 should_continue
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `state` | `ReActState` | 必填，无默认 | LangGraph 条件边自动传入 | 必须包含 `should_act`；缺少时 `KeyError` | `{"should_act": True, ...}` |
-
-**参数详解**
-
-`state` 是当前全局状态，本函数只读取 `should_act`，它由 `think_node` 写入，表示 LLM 是否请求了工具调用。这个字段是 ReAct 循环是否继续的关键开关：`True` 表示需要执行工具，`False` 表示可以提取长期记忆并结束。LangGraph 会把本函数返回值映射到条件边目标，因此返回的字符串必须等于 `conditional_edges` 字典中的键。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 | 示例 |
-| --- | --- | --- | --- | --- |
-| 分支目标 | `str` | `"act"` / `"end"` | 下一节点或结束 | `"act"` |
-
-**返回详解**
-
-返回 `"act"` 时，LangGraph 会把流程交给 `act_node` 执行工具；返回 `"end"` 时，流程进入 `extract_node` 然后结束。这个返回值不是节点实例，而是节点名称/分支 key，所以必须和 `build_graph()` 中 `add_conditional_edges` 的映射一致。
-
-**作用**
-
-```text
-作为 conditional_edges 的判断函数，决定 think 后走 act 还是 extract
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def should_continue(state: ReActState) -> str:
@@ -1289,56 +1151,40 @@ def should_continue(state: ReActState) -> str:
     接收：ReActState
     返回："act" 或 "end"
     """
+    # should_act=True 表示还有工具要执行，回到 act
     if state["should_act"]:
         return "act"
+    # should_act=False 表示任务完成，进入 extract 后结束
     return "end"
 ```
 
-**调用链**
+**参数**
 
-```text
-graph.add_conditional_edges("think", should_continue, {"act": "act", "end": "extract"})
-```
+- `state`: ReActState，必须包含 should_act。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. state 缺少 should_act -> KeyError。
-2. 返回值不在条件边映射中 -> LangGraph 运行时错误。
+should_act=True -> act；False -> end。
+
+**数据流举例**
+
+should_act -> 条件字符串 -> conditional_edges 映射。
+
+**关键点与边界**
+
+返回值必须匹配 add_conditional_edges 的 key。
+
+**伪代码调用示例**
+
+```python
+should_continue({"should_act": True})
+# 返回 "act"
 ```
 
 <a id="func-graph-build_graph"></a>
 #### 4.4.5 build_graph
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `provider` | `str` | 必填，无默认 | `create_runtime()` 从 `.env` 或调用方传入 | 必须是 `providers.toml` 中的 key | `"ollama"` |
-| `checkpointer` | LangGraph checkpointer | 必填，关键字参数 | `create_runtime()` 创建 `SqliteSaver` | 必须可传给 `compile(checkpointer=...)` | `SqliteSaver(conn)` |
-| `memory_store` | `MemoryStore` / `LongTermMemoryStore` | 必填，关键字参数 | `create_runtime()` 创建 | 必须实现 `get_memory_context()` / `merge_facts()` | `LongTermMemoryStore(path)` |
-
-**参数详解**
-
-`provider` 决定 `get_llm()` 创建哪家模型，进而决定整个图使用哪个供应商；它是图级配置，不随节点循环变化。`checkpointer` 是 LangGraph 保存多轮对话历史的基础设施，`thread_id` 通过 config 传入后，同一会话的消息会从 checkpoint 恢复。`memory_store` 是长期记忆读写入口，图节点用它注入长期记忆和提取新事实。这三个参数都由 `create_runtime()` 显式准备，确保 `build_graph()` 本身不产生数据库副作用。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 | 示例 |
-| --- | --- | --- | --- | --- |
-| app | 编译后的 LangGraph app | 可被 `invoke()` / `stream()` 调用 | CLI/Web 通过 `runtime.app` 使用 | `CompiledStateGraph` |
-
-**返回详解**
-
-返回的是编译后的 LangGraph app，是 CLI/Web 实际运行的对象。它内部包含 `think`、`act`、`observe`、`extract` 节点和条件边，并已绑定 `checkpointer`。调用方通过 `app.stream(...)` 获取节点更新，而不是直接调用单个节点函数。
-
-**作用**
-
-```text
-创建 LLM、绑定工具、组装节点和边、编译图
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def build_graph(
@@ -1356,22 +1202,30 @@ def build_graph(
         memory_store：长期记忆 Store
     返回：编译后的 LangGraph app
     """
+    # 先创建原始模型
     llm = get_llm(provider)
+    # 再绑定工具，得到 think 节点使用的模型
     llm_with_tools = llm.bind_tools(TOOLS)
 
+    # 用 ReActState 定义图的状态契约
     graph = StateGraph(ReActState)
+    # 注册 think 节点，并通过 lambda 闭包注入 llm/memory_store
     graph.add_node(
         "think",
         lambda state: think_node(state, llm_with_tools, llm, memory_store),
     )
+    # 注册 think 节点，并通过 lambda 闭包注入 llm/memory_store
     graph.add_node("act", act_node)
+    # 注册 think 节点，并通过 lambda 闭包注入 llm/memory_store
     graph.add_node("observe", observe_node)
+    # 注册 think 节点，并通过 lambda 闭包注入 llm/memory_store
     graph.add_node(
         "extract",
         lambda state: extract_memory_facts(state, llm, memory_store),
     )
 
     graph.set_entry_point("think")
+    # think 后根据 should_continue 决定去 act 还是 extract
     graph.add_conditional_edges(
         "think",
         should_continue,
@@ -1384,21 +1238,33 @@ def build_graph(
     graph.add_edge("observe", "think")
     graph.add_edge("extract", END)
 
+    # 编译图并绑定 checkpointer，返回 CLI/Web 可运行对象
     return graph.compile(checkpointer=checkpointer)
 ```
 
-**调用链**
+**参数**
 
-```text
-runtime.create_runtime() -> build_graph(...)
-```
+- `provider`: 供应商名。
+- `checkpointer`: LangGraph checkpointer。
+- `memory_store`: MemoryStore。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. provider 无效 -> get_llm() 抛 ValueError。
-2. checkpointer/memory_store 缺失 -> 编译时或运行时错误。
-3. build_graph 不在 import 阶段执行，避免模块导入产生数据库副作用。
+正常：组装图并编译；异常：provider 无效或依赖缺失。
+
+**数据流举例**
+
+provider -> get_llm -> bind_tools -> StateGraph -> compile。
+
+**关键点与边界**
+
+不在 import 阶段执行；通过 lambda 闭包注入 think/extract 依赖。
+
+**伪代码调用示例**
+
+```python
+app = build_graph("ollama", checkpointer=cp, memory_store=store)
+# 返回编译后的 LangGraph app
 ```
 
 <a id="module-memory-contracts"></a>
@@ -1421,33 +1287,7 @@ CATEGORIES = (
 <a id="class-memory-contracts-memory_store"></a>
 #### 4.5.1 MemoryStore
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| 无构造参数 | - | - | 类型定义 | Protocol 不实例化 | - |
-
-**参数详解**
-
-`MemoryStore` 是长期记忆 Provider 的接口，描述“图面代码需要什么样的记忆读写能力”，而不是具体实现。它不保存连接、不持有数据库路径，因此没有构造参数。`LongTermMemoryStore` 通过提供 `get_memory_context()` 和 `merge_facts()` 结构性实现该接口。`memory.py` 依赖这个接口后，可以测试假 Store，也可以在未来替换 SQLite 实现而不改 `think_node` 和 `extract_node`。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 接口定义 | `MemoryStore` Protocol | 不可实例化 | 描述两个方法契约 |
-
-**返回详解**
-
-这里没有运行时返回值，而是定义后续函数依赖的接口形状。实现类必须能读取项目级长期记忆上下文，并写入合并后的事实。`runtime.AgentRuntime` 仍保存具体 `LongTermMemoryStore`，因为 `close()` 需要访问 SQLite 生命周期；图内部则统一按 `MemoryStore` 使用。
-
-**作用**
-
-```text
-约束 memory.py 只依赖 get_memory_context / merge_facts，不依赖具体 SQLite 类
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 @runtime_checkable
@@ -1465,123 +1305,104 @@ class MemoryStore(Protocol):
     ) -> None: ...
 ```
 
-**调用链**
+**参数**
 
-```text
-memory.py 依赖 MemoryStore
-LongTermMemoryStore 结构性实现 MemoryStore
-```
+无构造参数，是 Protocol。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. Protocol 不强制签名完全一致，但调用方会按这两个方法使用。
-2. 传入对象缺少方法时，运行时才抛 AttributeError。
+被 memory.py 依赖；LongTermMemoryStore 实现。
+
+**数据流举例**
+
+MemoryStore 接口 -> LongTermMemoryStore SQLite 实现。
+
+**关键点与边界**
+
+只约定 get_memory_context 和 merge_facts。
+
+**伪代码调用示例**
+
+```python
+class FakeStore:
+    def get_memory_context(self, scope="project"): ...
+    def merge_facts(self, scope, category, facts, source_thread_id=None): ...
+# FakeStore 结构性满足 MemoryStore
 ```
 
 <a id="func-memory-contracts-get_memory_context"></a>
 #### 4.5.2 get_memory_context
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `scope` | `str` | 可选，默认 `"project"` | 调用方显式传入或使用默认 | 必须与写入时使用的 scope 一致；不同 scope 是独立记忆域 | `"project"` |
-
-**参数详解**
-
-`scope` 标识长期记忆的作用域，用来把不同项目的记忆隔离开。当前项目固定使用 `"project"`，表示项目级共享记忆；本方法只读取该作用域下所有类别的记忆文本。它不负责写入，也不负责过滤单条事实；返回结果会由 `build_long_term_memory_section()` 包装成 `SystemMessage`。如果 scope 中没有任何记忆，调用方应得到空字符串。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 示例 |
-| --- | --- | --- | --- |
-| 记忆上下文 | `str` | 空字符串或多类事实文本 | `"user_preferences:\n- 用户喜欢简洁回答"` |
-
-**返回详解**
-
-返回文本是已经格式化好的长期记忆内容，直接适合拼进 `SystemMessage`。空字符串表示当前没有记忆，调用方不会生成长期记忆段；非空时按类别分行展示。这个返回值不是 JSON，也不是 SQL 行，而是给 LLM 看的自然语言文本。
-
-**作用**
-
-```text
-定义读取长期记忆上下文的接口
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
-def get_memory_context(self, scope: str = MEMORY_SCOPE) -> str: ...
+    # 接口方法：按 scope 返回可注入 LLM 的长期记忆文本
+    def get_memory_context(self, scope: str = MEMORY_SCOPE) -> str: ...
 ```
 
-**调用链**
+**参数**
 
-```text
-build_long_term_memory_section() -> memory_store.get_memory_context()
-```
+- `scope`: 记忆作用域，默认 project。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. 实现类连接已关闭 -> 数据库异常。
-2. 返回类型不是 str -> 调用方可能生成错误消息。
+返回格式化记忆文本；无记忆返回空字符串。
+
+**数据流举例**
+
+scope -> Store 查询 -> 格式化文本。
+
+**关键点与边界**
+
+不写入，只读取。
+
+**伪代码调用示例**
+
+```python
+store.get_memory_context("project")
+# 返回记忆文本或空字符串
 ```
 
 <a id="func-memory-contracts-merge_facts"></a>
 #### 4.5.3 merge_facts
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `scope` | `str` | 必填，无默认 | `extract_memory_facts()` 传入 `MEMORY_SCOPE` | 必须与读取时 scope 一致 | `"project"` |
-| `category` | `str` | 必填，无默认 | `extract_memory_facts()` 遍历 `CATEGORIES` 传入 | 必须是已定义类别 | `"user_preferences"` |
-| `facts` | `list` | 必填，无默认 | LLM 提取并解析后的 JSON 数组 | 元素会转成字符串并去重；空列表直接返回 | `["用户喜欢简洁回答"]` |
-| `source_thread_id` | `str \| None` | 可选，默认 `None` | `extract_memory_facts()` 从 LangGraph config 读取 | 仅记录来源会话，不影响合并逻辑 | `"cli-default"` |
-
-**参数详解**
-
-`scope` 和 `category` 共同定位一条长期记忆存储行，决定新事实写入哪个作用域、哪个类别。`facts` 是本次从对话中提取的新事实，不是完整对话；本方法会读取旧事实，按精确文本去重并追加。`source_thread_id` 只用于记录这些事实来自哪个会话，帮助追踪记忆来源。写入后，后续 `get_memory_context()` 会把这些事实拼回上下文。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 无 | `None` | 始终 `None` | 写入是副作用操作 |
-
-**返回详解**
-
-本方法没有有意义的返回值，成功与否通过 SQLite 是否 commit 体现。调用方 `extract_memory_facts()` 不会读取返回值，只依赖写入完成后 `get_memory_context()` 能读到新事实。失败时异常会向上传播，由 `extract_memory_facts()` 的 try/except 捕获。
-
-**作用**
-
-```text
-定义写入并合并长期记忆的接口
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
-def merge_facts(
-    self,
-    scope: str,
-    category: str,
-    facts: list,
-    source_thread_id: str | None = None,
-) -> None: ...
+    # 接口方法：按 scope+category 合并新事实，写入实现层
+    def merge_facts(
+        self,
+        scope: str,
+        category: str,
+        facts: list,
+        source_thread_id: str | None = None,
+    ) -> None: ...
 ```
 
-**调用链**
+**参数**
 
-```text
-extract_memory_facts() -> memory_store.merge_facts()
-```
+- `scope`: 作用域。
+- `category`: 类别。
+- `facts`: 新事实列表。
+- `source_thread_id`: 来源会话，可选。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. facts 为空 -> 直接返回，不写数据库。
-2. SQLite 写入失败 -> 异常传播给 extract_memory_facts()。
+正常：写入并合并；边界：facts 为空直接返回。
+
+**数据流举例**
+
+facts -> 去重合并 -> SQLite upsert。
+
+**关键点与边界**
+
+只描述接口，具体去重/限量由实现负责。
+
+**伪代码调用示例**
+
+```python
+store.merge_facts("project", "entities", ["test2"])
+# 无返回值，写入后 get_memory_context 可读
 ```
 
 <a id="module-memory"></a>
@@ -1598,38 +1419,14 @@ SUMMARY_TOKEN_THRESHOLD = 6000
 <a id="func-memory-parse_memory_json"></a>
 #### 4.6.1 parse_memory_json
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `content` | `str` | 必填，无默认 | `extract_memory_facts()` 传入 `response.content` | 必须是可解析 JSON 的文本，允许 ``` 代码围栏；非法 JSON 抛异常 | `"{\"user_preferences\": []}"` |
-
-**参数详解**
-
-`content` 是 LLM 返回的长期记忆提取文本，代表模型认为值得长期记住的结构化信息。它通常是一段 JSON，但也可能被模型包在 Markdown ``` 代码块中，因此本函数会先清理围栏再解析。解析出的 dict 会由 `extract_memory_facts()` 按类别消费；如果模型返回了额外说明文字，本函数不会做容错，而是让 `json.loads` 失败。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 示例 |
-| --- | --- | --- | --- |
-| 记忆数据 | `dict` | 包含五个类别的 JSON 对象 | `{"user_preferences": [], "project_facts": [], ...}` |
-
-**返回详解**
-
-返回 dict 是长期记忆的中间结构，不是最终写入 Store 的格式。它的 key 应匹配 `CATEGORIES`，value 是事实数组；`extract_memory_facts()` 会遍历这些类别并调用 `merge_facts()`。如果解析出的顶层不是 dict，函数会抛 `ValueError`，让上层捕获。
-
-**作用**
-
-```text
-去除 ``` 代码围栏并解析 JSON
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def parse_memory_json(content: str) -> dict:
     """解析 LLM 返回的长期记忆 JSON。"""
+    # 统一转字符串并去首尾空白
     text = str(content).strip()
+    # LLM 可能把 JSON 包在 Markdown 代码围栏里，先剥掉围栏
     if text.startswith("```"):
         lines = [
             line
@@ -1637,78 +1434,68 @@ def parse_memory_json(content: str) -> dict:
             if not line.startswith("```")
         ]
         text = "\n".join(lines).strip()
+    # 真正解析 JSON；解析失败会抛异常给上层
     data = json.loads(text)
+    # 顶层必须是 dict，否则不是我们约定的记忆 JSON
     if not isinstance(data, dict):
         raise ValueError("memory extraction must return a JSON object")
     return data
 ```
 
-**调用链**
+**参数**
 
-```text
-extract_memory_facts() -> parse_memory_json()
-```
+- `content`: LLM 返回的 JSON 文本，允许 ``` 围栏。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. JSON 非法 -> json.JSONDecodeError。
-2. 顶层不是 dict -> ValueError。
-3. 两者都会被 extract_memory_facts() 的 try/except 捕获。
+正常：返回 dict；异常：非法 JSON 或顶层非 dict。
+
+**数据流举例**
+
+content -> 剥围栏 -> json.loads -> dict。
+
+**关键点与边界**
+
+解析失败由 extract_memory_facts 捕获，不中断对话。
+
+**伪代码调用示例**
+
+```python
+parse_memory_json('{"user_preferences": []}')
+# 返回 dict
 ```
 
 <a id="func-memory-extract_memory_facts"></a>
 #### 4.6.2 extract_memory_facts
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `state` | `ReActState` | 必填，无默认 | `extract` 节点自动传入 | 需要 `summary` 和 `messages` 用于构造 prompt | 见 [4.0.1](#contract-react-state) |
-| `llm` | LangChain ChatModel 对象 | 必填，无默认 | `build_graph()` 闭包注入 | 必须有 `.invoke()`；不要求绑定工具 | `get_llm("anthropic")` |
-| `memory_store` | `MemoryStore` | 必填，无默认 | `build_graph()` 闭包注入 | 必须实现 `merge_facts()` | `LongTermMemoryStore(path)` |
-
-**参数详解**
-
-`state` 提供本次对话的摘要和历史消息，用于构造长期记忆提取 prompt；它只在最终回复后使用，不会继续驱动工具循环。`llm` 是不带工具的原始模型，确保提取时只输出 JSON 记忆而不请求工具。`memory_store` 是记忆写入目标，本函数把解析出的各类别事实通过 `merge_facts()` 写入 SQLite。整体流程是“最终回复完成后，异步从对话中沉淀可跨会话复用的记忆”。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 状态更新 | `dict` | 通常为 `{}` | 不向 LangGraph 写入新字段 |
-
-**返回详解**
-
-返回空 dict 表示 `extract` 节点不修改全局状态，只产生长期记忆写入副作用。即便提取成功，返回值也不会改变 `messages` 或 `summary`。因此该节点主要价值是“外部持久化”，不是“状态更新”。
-
-**作用**
-
-```text
-最终回复后提取项目级长期记忆；失败时保留旧记忆，不中断对话
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def extract_memory_facts(state, llm, memory_store: MemoryStore) -> dict:
     """最终回复后提取项目级长期记忆；失败时保留旧记忆，不中断对话。"""
     try:
         config = get_config()
+        # 从 LangGraph config 拿 thread_id，作为长期记忆来源会话
         thread_id = config.get("configurable", {}).get("thread_id")
 
+        # 第一条是提取指令，告诉 LLM 只输出固定 JSON
         prompt = [SystemMessage(content=EXTRACT_PROMPT)]
+        # 有会话摘要时把摘要也放进去，提取结果更完整
         if state.get("summary"):
             prompt.append(
                 SystemMessage(content=f"会话摘要：\n{state['summary']}")
             )
+        # 把对话消息追加到 prompt，让 LLM 基于真实对话提取
         prompt.extend(state["messages"])
 
+        # 调用原始 LLM 生成记忆 JSON
         response = llm.invoke(prompt)
         data = parse_memory_json(response.content)
+        # 遍历五个固定类别，逐类写入 store
         for category in CATEGORIES:
             facts = data.get(category)
             if isinstance(facts, list):
+                # 只写入当前提取到的事实，不覆盖旧记忆
                 memory_store.merge_facts(
                     MEMORY_SCOPE,
                     category,
@@ -1720,258 +1507,183 @@ def extract_memory_facts(state, llm, memory_store: MemoryStore) -> dict:
     return {}
 ```
 
-**调用链**
+**参数**
 
-```text
-graph.add_node("extract", lambda state: extract_memory_facts(state, llm, memory_store))
-```
+- `state`: 当前状态。
+- `llm`: 原始模型。
+- `memory_store`: MemoryStore。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. LLM 返回非法 JSON -> 打印日志，保留旧记忆。
-2. merge_facts 抛异常 -> 打印日志，不中断对话。
-3. 不会覆盖旧记忆，因为失败发生在写入前。
+正常：提取并写入记忆；异常：LLM/JSON/store 失败只打印日志。
+
+**数据流举例**
+
+state+summary+messages -> LLM JSON -> 按类别 merge_facts。
+
+**关键点与边界**
+
+不覆盖旧记忆，失败不中断对话。
+
+**伪代码调用示例**
+
+```python
+extract_memory_facts(state, llm, store)
+# 返回 {}，并把长期记忆写入 store
 ```
 
 <a id="func-memory-history_tokens"></a>
 #### 4.6.3 history_tokens
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `messages` | 消息列表 | 必填，无默认 | `prepare_conversation()` 传入 `state["messages"]` | 必须可被 `count_tokens_approximately()` 估算 | `[HumanMessage(...), AIMessage(...)]` |
-
-**参数详解**
-
-`messages` 是当前完整对话历史，代表尚未压缩的全部上下文。本函数不裁剪、不修改它，只估算它大约占用多少 token。估算结果用于和 `SUMMARY_TOKEN_THRESHOLD` 比较，决定是否触发动态摘要。这个参数必须反映真实历史，因为低估会导致上下文膨胀，高估会导致过早压缩。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 示例 |
-| --- | --- | --- | --- |
-| token 数 | `int` | 非负整数 | `6500` |
-
-**返回详解**
-
-返回的是近似 token 数，不是精确 tokenizer 结果。`prepare_conversation()` 用它判断是否超过 `6000` 阈值；超过时继续寻找可退役旧消息并生成摘要。该返回值不进入状态，也不会被写入 checkpoint。
-
-**作用**
-
-```text
-估算历史消息 token，用于判断是否触发摘要
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def history_tokens(messages) -> int:
     """估算一段消息历史约占用的 token 数。"""
+    # 用近似 token 估算历史长度，判断是否触发摘要
     return count_tokens_approximately(messages)
 ```
 
-**调用链**
+**参数**
 
-```text
-prepare_conversation() -> history_tokens()
-```
+- `messages`: 消息列表。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. messages 为空 -> 估算为 0，不触发摘要。
-2. 消息对象不可估算 -> 由底层工具抛异常。
+返回近似 token 数。
+
+**数据流举例**
+
+messages -> count_tokens_approximately -> int。
+
+**关键点与边界**
+
+只做估算，不做精确 tokenizer。
+
+**伪代码调用示例**
+
+```python
+history_tokens([HumanMessage(content="你好")])
+# 返回 非负整数
 ```
 
 <a id="func-memory-build_long_term_memory_section"></a>
 #### 4.6.4 build_long_term_memory_section
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `memory_store` | `MemoryStore` | 必填，无默认 | `compose_llm_input()` 传入，最终来自 `think_node` 闭包 | 必须实现 `get_memory_context()`；缺方法 `AttributeError` | `LongTermMemoryStore("data/memory.db")` |
-
-**参数详解**
-
-`memory_store` 是项目级长期记忆的访问入口，本函数通过它读取当前项目作用域内已经记住的事实。这里只执行“读取”，不会写入、合并或删除记忆。当前真实对象是 `LongTermMemoryStore`，它从 SQLite 中把五类事实格式化成一段可阅读的文本。读取结果会包装成 `SystemMessage`，交给 `compose_llm_input()` 拼到最终 LLM 输入里。也就是说，这个参数决定了 LLM 是否能看到之前跨会话记住的用户偏好和项目事实。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 示例 |
-| --- | --- | --- | --- |
-| 返回列表 | `list[SystemMessage]` | `[]` 或长度为 `1` 的列表 | `[SystemMessage(content="项目长期记忆：\nuser_preferences:\n- 用户喜欢简洁回答")]` |
-
-**返回详解**
-
-返回空列表表示当前没有可注入的长期记忆，调用方不会插入 `SystemMessage`。返回一个 `SystemMessage` 时，其 `content` 是“项目长期记忆：”和 `MemoryStore.get_memory_context()` 结果的拼接。这个列表会被 `compose_llm_input()` 放在最终 LLM 输入的第一段，排在会话摘要和最近消息之前。返回结果不直接调用 LLM，只是为 `think_node` 组装输入做准备。
-
-**作用**
-
-```text
-构造项目长期记忆 SystemMessage 段
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def build_long_term_memory_section(memory_store: MemoryStore) -> list:
     """构造项目级长期记忆 SystemMessage 段。"""
+    # 从项目长期记忆 Store 读取格式化文本
     context = memory_store.get_memory_context(MEMORY_SCOPE)
+    # 没有记忆就不生成 SystemMessage，避免空段
     if not context:
         return []
+    # 有记忆时生成长期记忆 SystemMessage，放到 LLM 输入最前面
     return [SystemMessage(content=f"项目长期记忆：\n{context}")]
 ```
 
-**调用链**
+**参数**
 
-```text
-think_node -> compose_llm_input() -> build_long_term_memory_section(memory_store)
-```
+- `memory_store`: MemoryStore。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. memory_store 没有 get_memory_context() -> AttributeError。
-2. memory_store 为 None -> TypeError。
-3. get_memory_context() 抛异常 -> 向上传播，think_node 运行失败。
+正常：有记忆返回 SystemMessage；边界：无记忆返回空列表。
+
+**数据流举例**
+
+store -> get_memory_context -> SystemMessage -> LLM 输入第一段。
+
+**关键点与边界**
+
+只读不写，排在摘要之前。
+
+**伪代码调用示例**
+
+```python
+build_long_term_memory_section(store)
+# 返回 [SystemMessage(...)] 或 []
 ```
 
 <a id="func-memory-build_summary_section"></a>
 #### 4.6.5 build_summary_section
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `summary` | `str` | 必填，无默认 | `compose_llm_input()` 传入 `prepare_conversation()` 的结果 | 空字符串表示无摘要；非空会生成 SystemMessage | `"用户偏好：喜欢简洁回答"` |
-
-**参数详解**
-
-`summary` 是当前会话的动态摘要，代表早期对话被压缩后需要保留的关键信息。本函数只负责把它变成 `SystemMessage`，不负责判断摘要是否过期。空字符串表示没有可用的会话摘要，调用方不应生成摘要段；非空字符串表示需要把摘要注入 LLM 输入。该摘要来自 `prepare_conversation()`，最终消费方是 `think_node` 中的模型调用。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 示例 |
-| --- | --- | --- | --- |
-| 返回列表 | `list[SystemMessage]` | `[]` 或长度为 `1` 的列表 | `[SystemMessage(content="...")]` |
-
-**返回详解**
-
-返回空列表表示不注入会话摘要段；返回一个 `SystemMessage` 表示把摘要放在长期记忆之后、最近消息之前。该返回值不修改状态，只参与构造 LLM 输入。如果 `summary` 是纯空白字符串，当前实现会按空处理。
-
-**作用**
-
-```text
-构造会话摘要 SystemMessage 段
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def build_summary_section(summary: str) -> list:
     """构造会话摘要 SystemMessage 段。"""
+    # 没有摘要就返回空列表，LLM 输入不插入摘要段
     if not summary:
         return []
+    # 有摘要时把它包装成 SystemMessage
     return [SystemMessage(content=summary)]
 ```
 
-**调用链**
+**参数**
 
-```text
-compose_llm_input() -> build_summary_section()
-```
+- `summary`: 会话摘要字符串。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. summary 不是 str -> 类型错误。
-2. 空字符串/纯空白 -> 返回空列表，不报错。
+正常：非空生成 SystemMessage；边界：空返回空列表。
+
+**数据流举例**
+
+summary -> SystemMessage -> LLM 输入第二段。
+
+**关键点与边界**
+
+不修改摘要，只做包装。
+
+**伪代码调用示例**
+
+```python
+build_summary_section("摘要")
+# 返回 [SystemMessage(content="摘要")]
 ```
 
 <a id="func-memory-build_recent_history_section"></a>
 #### 4.6.6 build_recent_history_section
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `recent_history` | `list` | 必填，无默认 | `compose_llm_input()` 传入 `prepare_conversation()` 的窗口结果 | 必须可被 list() 复制 | `[HumanMessage(...), ToolMessage(...)]` |
-
-**参数详解**
-
-`recent_history` 是本次应送入 LLM 的最近消息窗口，代表当前轮真正参与推理的对话片段。它已经由 `trim_messages()` 裁剪过，本函数不再次裁剪。返回一份新列表是为了避免调用方修改原始窗口对象，让 `compose_llm_input()` 拼接时不影响 `prepare_conversation()` 后续逻辑。这个参数最终决定 LLM 能看到哪些实时消息。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 示例 |
-| --- | --- | --- | --- |
-| 返回列表 | `list` | 与原列表内容相同的新列表 | `[HumanMessage(...), AIMessage(...)]` |
-
-**返回详解**
-
-返回的是浅拷贝消息列表，内容与原 `recent_history` 相同，但对象身份不同。`compose_llm_input()` 会把它追加到长期记忆和摘要 SystemMessage 之后；如果返回原列表，后续调用方修改可能污染窗口数据。返回值本身不进入 checkpoint。
-
-**作用**
-
-```text
-提供最近消息段，不负责裁剪
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def build_recent_history_section(recent_history: list) -> list:
     """返回最近消息列表，不负责裁剪。"""
+    # 浅拷贝最近消息，避免 compose_llm_input 修改污染原窗口
     return list(recent_history)
 ```
 
-**调用链**
+**参数**
 
-```text
-compose_llm_input() -> build_recent_history_section()
-```
+- `recent_history`: 最近消息列表。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. recent_history 不可迭代 -> TypeError。
-2. 空列表 -> 返回空列表，仍可组成 LLM 输入。
+始终返回浅拷贝列表。
+
+**数据流举例**
+
+recent_history -> list(recent_history) -> LLM 输入第三段。
+
+**关键点与边界**
+
+避免调用方修改污染原窗口。
+
+**伪代码调用示例**
+
+```python
+build_recent_history_section(messages)
+# 返回新列表
 ```
 
 <a id="func-memory-compose_llm_input"></a>
 #### 4.6.7 compose_llm_input
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `memory_store` | `MemoryStore` | 必填，无默认 | `think_node()` 传入 | 必须实现 `get_memory_context()` | `LongTermMemoryStore(path)` |
-| `summary` | `str` | 必填，无默认 | `prepare_conversation()` 返回 | 可为空字符串 | `"用户喜欢简洁回答"` |
-| `recent_history` | `list` | 必填，无默认 | `prepare_conversation()` 返回 | 可为空列表 | `[HumanMessage(...)]` |
-
-**参数详解**
-
-`memory_store` 提供项目级长期记忆，`summary` 提供会话级摘要，`recent_history` 提供最近消息；三个输入共同决定 LLM 本次看到的完整上下文。本函数不判断它们是否合理，只按固定顺序拼接：长期记忆、摘要、最近消息。`memory_store` 为空时生成空段，`summary` 为空时也生成空段，`recent_history` 为空时仍可返回仅含 SystemMessage 的输入。返回结果直接传给 `llm_with_tools.invoke()`。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 示例 |
-| --- | --- | --- | --- |
-| LLM 输入 | `list` | SystemMessage + 消息的组合 | `[SystemMessage(...), SystemMessage(...), HumanMessage(...)]` |
-
-**返回详解**
-
-返回的是最终传给模型的输入消息列表，顺序固定为长期记忆、摘要、最近消息。调用方是 `think_node()`，它会把该列表传给 `llm_with_tools.invoke()`。这个顺序是当前记忆系统的核心约定：先给项目级事实，再给会话摘要，最后给实时历史。
-
-**作用**
-
-```text
-按顺序组装长期记忆、会话摘要、最近消息
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def compose_llm_input(
@@ -1980,6 +1692,7 @@ def compose_llm_input(
     recent_history: list,
 ) -> list:
     """按顺序组装长期记忆、会话摘要、最近消息。"""
+    # 按 长期记忆 -> 摘要 -> 最近消息 顺序拼接，这是记忆注入的核心顺序
     return (
         build_long_term_memory_section(memory_store)
         + build_summary_section(summary)
@@ -1987,115 +1700,120 @@ def compose_llm_input(
     )
 ```
 
-**调用链**
+**参数**
 
-```text
-think_node() -> compose_llm_input()
-```
+- `memory_store`: MemoryStore。
+- `summary`: 摘要。
+- `recent_history`: 最近消息。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. memory_store 方法缺失 -> AttributeError。
-2. recent_history 不可迭代 -> TypeError。
-3. 三个段都为空时仍能返回空列表，但 LLM 调用会失败。
+按固定顺序拼接三段，空段会被跳过。
+
+**数据流举例**
+
+长期记忆段 + 摘要段 + 最近消息段 -> LLM 输入。
+
+**关键点与边界**
+
+顺序是记忆系统核心约定。
+
+**伪代码调用示例**
+
+```python
+compose_llm_input(store, summary, history)
+# 返回 [SystemMessage(...), SystemMessage(...), HumanMessage(...)]
 ```
 
 <a id="func-memory-build_summary"></a>
 #### 4.6.8 build_summary
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `llm` | LangChain ChatModel 对象 | 必填，无默认 | `prepare_conversation()` 传入 | 必须有 `.invoke()` | `get_llm("anthropic")` |
-| `retired_messages` | `list` | 必填，无默认 | `prepare_conversation()` 计算出的旧消息 | 空列表时直接返回旧摘要 | `[HumanMessage(...), AIMessage(...)]` |
-| `old_summary` | `str` | 可选，默认 `""` | `prepare_conversation()` 从 state 读取 | 空字符串表示没有旧摘要 | `"已有摘要..."` |
-
-**参数详解**
-
-`llm` 是不带工具的原始模型，负责把旧消息压缩成摘要，避免摘要生成时请求工具。`retired_messages` 是被窗口淘汰但仍有信息价值的消息，代表需要“遗忘原文、保留要点”的内容。`old_summary` 是之前已有的会话摘要，生成新摘要时会一并交给 LLM，使摘要可以增量更新而不是每次从零开始。返回值会作为新 `summary` 写回状态。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 示例 |
-| --- | --- | --- | --- |
-| 新摘要 | `str` | 非空摘要；无旧消息时返回旧摘要 | `"用户关注天气，喜欢简洁回答"` |
-
-**返回详解**
-
-返回的是新会话摘要字符串，最终由 `prepare_conversation()` 返回并在 `think_node` 中写入状态。如果 `retired_messages` 为空，直接返回 `old_summary`，避免无意义调用 LLM。该摘要随后通过 `build_summary_section()` 注入 LLM 输入。
-
-**作用**
-
-```text
-把旧消息和已有摘要压缩成新的会话摘要
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def build_summary(llm, retired_messages, old_summary: str = "") -> str:
     """使用不带工具的原始 LLM 生成或更新摘要。"""
+    # 没有待归档消息就保留旧摘要，不调 LLM
     if not retired_messages:
         return old_summary
 
+    # 构造 prompt 第一段：摘要系统指令，告诉 LLM 输出格式和保留重点
     prompt = [SystemMessage(content=SUMMARY_PROMPT)]
+    # 有旧摘要就进入增量更新模式
     if old_summary:
+        # 旧摘要加入 prompt，让模型在旧摘要基础上合并新消息
         prompt.append(SystemMessage(content=f"已有摘要：\n{old_summary}"))
+    # 把所有待归档历史消息追加进去，完整 prompt = 指令 + 旧摘要 + 新消息
     prompt.extend(retired_messages)
 
+    # 调用不带工具的原始 LLM 生成或更新摘要
     response = llm.invoke(prompt)
+    # 返回清理后的新摘要文本
     return str(response.content).strip()
 ```
 
-**调用链**
+**参数**
+
+- `llm`: 不带工具的原始模型。
+- `retired_messages`: 待归档历史消息列表。
+- `old_summary`: 旧摘要，默认空字符串。
+
+**整体执行场景**
+
+场景一：首次生成摘要，prompt = 系统提示 + 历史消息；场景二：增量更新，prompt = 系统提示 + 旧摘要 + 新归档消息。
+
+**数据流举例**
+
+旧摘要：
 
 ```text
-prepare_conversation() -> build_summary()
+用户喜欢喝咖啡，家住合肥。
 ```
 
-**失败模式**
+新的 `retired_messages`：
 
 ```text
-1. llm.invoke() 抛异常 -> 向上传播，当前版本不自动回退旧摘要。
-2. retired_messages 为空 -> 返回旧摘要，不调用 LLM。
+user: 周末想去爬山
+assistant: 推荐近郊的山
+```
+
+传给 LLM 的 prompt：
+
+```text
+【系统指令：生成对话摘要】
+已有摘要：
+用户喜欢喝咖啡，家住合肥。
+
+user: 周末想去爬山
+assistant: 推荐近郊的山
+```
+
+模型输出新摘要：
+
+```text
+用户喜欢喝咖啡，家住合肥；用户提到周末想去爬山，助手推荐了近郊的山。
+```
+
+**关键点与边界**
+
+```text
+1. retired_messages 为空时直接返回旧摘要，不调 LLM，避免无效调用。
+2. 增量模式依赖 LLM，模型能力弱时可能丢失信息。
+3. 不操作 LongTermMemoryStore；build_summary 只压缩对话上下文，
+   LongTermMemoryStore 负责抽取用户事实并持久化到 SQLite。
+```
+
+**伪代码调用示例**
+
+```python
+new_sum = build_summary(llm, retired_messages_1)
+new_sum2 = build_summary(llm, retired_messages_2, old_summary=new_sum)
 ```
 
 <a id="func-memory-prepare_conversation"></a>
 #### 4.6.9 prepare_conversation
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `state` | `ReActState` | 必填，无默认 | `think_node()` 传入 | 必须包含 `messages`；`summary` 缺失按空处理 | 见 [4.0.1](#contract-react-state) |
-| `llm` | LangChain ChatModel 对象 | 必填，无默认 | `think_node()` 传入 | 必须有 `.invoke()` | `get_llm("anthropic")` |
-| `recent_window` | `int` | 必填，无默认 | `think_node()` 传入 `MEMORY_WINDOW` | 必须为正整数 | `20` |
-
-**参数详解**
-
-`state` 提供完整消息历史和旧摘要，是本次记忆处理的输入。`llm` 只在超过 token 阈值时用于生成新摘要，不参与普通消息裁剪。`recent_window` 是最近窗口的消息条数上限，决定 `trim_messages()` 保留多少条实时历史。本函数同时决定“给 LLM 看什么”和“从 checkpoint 删什么”，是记忆压缩的关键入口。
-
-**快速返回表**
-
-| 返回 | 类型 | 是否总是返回 | 含义 | 示例 |
-| --- | --- | --- | --- | --- |
-| `summary` | `str` | 是 | 当前会话摘要 | `"用户喜欢简洁回答"` |
-| `recent_history` | `list` | 是 | 最近窗口消息 | `[HumanMessage(...), AIMessage(...)]` |
-| `removals` | `list[RemoveMessage]` | 是 | 需要删除的旧消息；未触发摘要时为空 | `[RemoveMessage(id="old-1")]` |
-
-**返回详解**
-
-返回三元组是 `think_node()` 组装 LLM 输入和状态更新的依据。`summary` 会写回 `ReActState.summary`；`recent_history` 会进入 LLM 输入；`removals` 会作为 `messages` 的一部分交给 `add_messages`，从 checkpoint 删除被摘要覆盖的旧消息。未超阈值时 `removals` 为空，保证旧消息不会在未总结前丢失。
-
-**作用**
-
-```text
-决定本次给 LLM 看什么，以及从 checkpoint 删除什么
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def prepare_conversation(state, llm, recent_window: int) -> tuple[str, list, list]:
@@ -2106,9 +1824,12 @@ def prepare_conversation(state, llm, recent_window: int) -> tuple[str, list, lis
     - recent_history: 本次应送入 LLM 的最近消息窗口。
     - removals: 被摘要覆盖后需要从 checkpoint 删除的旧消息。
     """
+    # 取完整历史消息，作为窗口裁剪和 token 判断的输入
     messages = state["messages"]
+    # 旧摘要可能不存在，按空字符串处理
     old_summary = state.get("summary") or ""
 
+    # 用 trim_messages 计算最近窗口，start_on=human 避免从工具消息中间开始
     recent_history = trim_messages(
         messages,
         max_tokens=recent_window,
@@ -2117,36 +1838,51 @@ def prepare_conversation(state, llm, recent_window: int) -> tuple[str, list, lis
         start_on="human",
     )
 
+    # 历史未超阈值时不做摘要，不删除旧消息
     if history_tokens(messages) <= SUMMARY_TOKEN_THRESHOLD:
         return old_summary, recent_history, []
 
+    # 收集窗口内要保留的消息 id
     kept_ids = {msg.id for msg in recent_history if msg.id is not None}
+    # 找出被窗口淘汰且带 id 的旧消息，作为摘要归档对象
     retired_messages = [
         msg
         for msg in messages
         if msg.id is not None and msg.id not in kept_ids
     ]  # retired_messages 是被裁剪掉的旧消息
+    # 没有可归档旧消息就保留旧摘要，不调用 LLM
     if not retired_messages:
         return old_summary, recent_history, []
 
+    # 用旧摘要 + 归档消息生成新摘要
     summary = build_summary(llm, retired_messages, old_summary)
+    # 为每条归档旧消息生成 RemoveMessage，交给 add_messages 删除
     removals = [RemoveMessage(id=msg.id) for msg in retired_messages]
     return summary, recent_history, removals
 ```
 
-**调用链**
+**参数**
 
-```text
-think_node() -> prepare_conversation()
-```
+- `state`: ReActState。
+- `llm`: 原始模型。
+- `recent_window`: 最近窗口消息条数，默认传 MEMORY_WINDOW。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. token 未超阈值 -> 不生成摘要，不删除旧消息。
-2. 没有可删除旧消息 -> 保留旧摘要。
-3. RemoveMessage 由 add_messages reducer 执行删除。
-4. trim_messages 或 build_summary 抛异常 -> 向上传播。
+未超阈值：只返回窗口；超阈值：生成摘要并返回 RemoveMessage。
+
+**数据流举例**
+
+state.messages -> trim_messages -> token 判断 -> build_summary -> (summary, recent_history, removals)。
+
+**关键点与边界**
+
+只有超阈值才删除旧消息，未总结前不丢历史。
+
+**伪代码调用示例**
+
+```python
+summary, recent, removals = prepare_conversation(state, llm, 20)
 ```
 
 <a id="module-memory-store"></a>
@@ -2157,38 +1893,23 @@ think_node() -> prepare_conversation()
 ```python
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "memory.db"
 MAX_FACTS_PER_CATEGORY = 100
+
+
+def _decode_facts_json(raw: str) -> list[str]:
+    """把 facts_json 列解析为事实字符串列表；损坏数据返回空列表。"""
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [str(item) for item in data]
 ```
 
 <a id="class-memory-store-long_term_memory_store"></a>
 #### 4.7.1 LongTermMemoryStore
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `db_path` | `str \| Path` | 可选，默认 `DEFAULT_DB_PATH` | `create_runtime()` 传入 | 父目录不存在时会自动创建；必须是可连接 SQLite 的路径 | `Path("data/memory.db")` |
-
-**参数详解**
-
-`db_path` 决定长期记忆存储到哪个 SQLite 文件，是项目级记忆的持久化位置。默认路径是项目根目录下 `data/memory.db`，与对话 checkpoint 共用同一数据库文件。创建实例时会自动创建父目录、打开连接并初始化 `long_term_memory` 表。该实例会被 `AgentRuntime.memory_store` 保存，供图节点读取和写入长期记忆。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 存储实例 | `LongTermMemoryStore` | 已连接 SQLite 的对象 | 提供读取、合并、清空和关闭能力 |
-
-**返回详解**
-
-返回的是持有 SQLite 连接的长期记忆 Store，不是接口对象。它结构性满足 `MemoryStore`，因此可以传给 `build_graph()` 和图节点。生命周期由 `AgentRuntime` 管理，使用结束后应调用 `close()` 关闭连接。
-
-**作用**
-
-```text
-管理项目级长期记忆的 SQLite 表
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 class LongTermMemoryStore:
@@ -2196,12 +1917,15 @@ class LongTermMemoryStore:
 
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH):
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)  # 数据库文件所在文件夹不存在就创建
+        #打开 SQLite 文件；check_same_thread=False 允许多线程访问
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        # 设置行工厂为 Row 类型，方便直接访问列值
         self.conn.row_factory = sqlite3.Row
+
         self._init_schema()
 
-    def _init_schema(self):
+    def _init_schema(self):# 初始化数据库表，_表示私有方法
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS long_term_memory (
@@ -2213,7 +1937,14 @@ class LongTermMemoryStore:
                 PRIMARY KEY (scope, category)
             )
             """
-        )
+        )#以上注释是给SQLite看的，造一张表，名叫 long_term_memory；如果已经造过了就跳过，别报错
+        #第 1 列叫 scope（范围），存文本，不许留空。
+        #第 2 列叫 category（分类），存文本，不许留空。
+        #第 3 列叫 facts_json（事实 JSON），存文本，不许留空。
+        #第 4 列叫 source_thread_id（来源线程 ID），存文本，可空。
+        #第 5 列叫 updated_at（更新时间），存文本，不许留空。
+
+        #提交事务后，数据库文件才会被写入
         self.conn.commit()
 
     def merge_facts(
@@ -2227,13 +1958,16 @@ class LongTermMemoryStore:
         if not facts:
             return
 
+        #get_facts 读取数据库里已经存在的旧事实
         existing = self.get_facts(scope, category)
+        #复制旧列表
         merged = list(existing)
+        #如果事实不为空且不在现有事实中，则添加到merged列表中
         for fact in facts:
             text = str(fact).strip()
             if text and text not in merged:
                 merged.append(text)
-
+        #保留最新 MAX_FACTS_PER_CATEGORY 条事实
         merged = merged[-MAX_FACTS_PER_CATEGORY:]
         self.conn.execute(
             """
@@ -2316,511 +2050,414 @@ class LongTermMemoryStore:
         return datetime.now(timezone.utc).isoformat()
 ```
 
-**调用链**
+**参数**
 
-```text
-runtime.create_runtime() -> LongTermMemoryStore(path)
-memory.py -> MemoryStore 接口 -> 实际调用 LongTermMemoryStore
-```
+- `db_path`: SQLite 文件路径，默认 data/memory.db。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. 路径目录不可写 -> 创建目录或连接失败。
-2. 数据库文件损坏 -> 建表或查询失败。
+构造时建目录、连接、建表。
+
+**数据流举例**
+
+db_path -> sqlite3.connect -> long_term_memory 表 -> 可读写 Store。
+
+**关键点与边界**
+
+实现 MemoryStore，并额外提供 clear_scope/close。
+
+**伪代码调用示例**
+
+```python
+store = LongTermMemoryStore("data/memory.db")
+# 返回已连接的 SQLite Store
 ```
 
 <a id="func-memory-store-init"></a>
 #### 4.7.2 __init__
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `db_path` | `str \| Path` | 可选，默认 `DEFAULT_DB_PATH` | `LongTermMemoryStore` 构造 | 必须是 SQLite 文件路径 | `"data/memory.db"` |
-
-**参数详解**
-
-`db_path` 指定长期记忆数据库文件，决定 Store 写入和读取的位置。构造时会创建父目录、连接 SQLite、设置 `Row` 工厂并调用 `_init_schema()`。这个方法是 Store 生命周期的起点；之后所有方法都通过 `self.conn` 操作同一个数据库连接。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 实例 | `LongTermMemoryStore` | 已初始化 | 可立即读写长期记忆 |
-
-**返回详解**
-
-构造完成后，对象已经拥有可用的数据库连接和表结构。`create_runtime()` 会保存它，`extract_memory_facts()` 随后调用它的读写方法。
-
-**作用**
-
-```text
-创建目录、连接 SQLite、初始化表结构
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
-def __init__(self, db_path: str | Path = DEFAULT_DB_PATH):
-    self.db_path = Path(db_path)
-    self.db_path.parent.mkdir(parents=True, exist_ok=True)
-    self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-    self.conn.row_factory = sqlite3.Row
-    self._init_schema()
+    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH):
+        # 保存数据库文件路径，后续所有方法都通过它访问
+        self.db_path = Path(db_path)
+        # 数据库目录不存在就创建，避免 sqlite3 连接失败
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)  # 数据库文件所在文件夹不存在就创建
+        #打开 SQLite 文件；check_same_thread=False 允许多线程访问
+        # 打开 SQLite 连接；check_same_thread=False 允许跨线程访问
+        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        # 设置行工厂为 Row 类型，方便直接访问列值
+        self.conn.row_factory = sqlite3.Row
+
+        # 初始化表结构，确保 long_term_memory 表存在
+        self._init_schema()
 ```
 
-**调用链**
+**参数**
 
-```text
-runtime.create_runtime() -> LongTermMemoryStore(path)
-```
+- `db_path`: 数据库文件路径。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. 父目录无法创建 -> OSError。
-2. SQLite 连接失败 -> sqlite3.Error。
+创建目录、打开连接、初始化表结构。
+
+**数据流举例**
+
+db_path -> Path -> mkdir -> connect -> _init_schema。
+
+**关键点与边界**
+
+check_same_thread=False 允许多线程访问。
+
+**伪代码调用示例**
+
+```python
+store = LongTermMemoryStore("data/memory.db")
 ```
 
 <a id="func-memory-store-init_schema"></a>
 #### 4.7.3 _init_schema
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 |
-| --- | --- | --- | --- | --- |
-| 无 | - | - | - | - |
-
-**参数详解**
-
-本方法没有业务参数，只负责确保 `long_term_memory` 表存在。表以 `(scope, category)` 为主键，一个作用域和一个类别只有一行 `facts_json`。它使用 `CREATE TABLE IF NOT EXISTS`，重复创建不会破坏已有数据。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 无 | `None` | 始终 `None` | 建表副作用 |
-
-**返回详解**
-
-没有返回值；成功表现为表结构已存在并 commit。之后 `merge_facts()` 才能安全执行 upsert。
-
-**作用**
-
-```text
-创建 long_term_memory 表
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
-def _init_schema(self):
-    self.conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS long_term_memory (
-            scope TEXT NOT NULL,
-            category TEXT NOT NULL,
-            facts_json TEXT NOT NULL,
-            source_thread_id TEXT,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (scope, category)
-        )
-        """
-    )
-    self.conn.commit()
+    def _init_schema(self):# 初始化数据库表，_表示私有方法
+        # 执行建表 SQL；CREATE TABLE IF NOT EXISTS 不会重复创建
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS long_term_memory (
+                scope TEXT NOT NULL,
+                category TEXT NOT NULL,
+                facts_json TEXT NOT NULL,
+                source_thread_id TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (scope, category)
+            )
+            """
+        )#以上注释是给SQLite看的，造一张表，名叫 long_term_memory；如果已经造过了就跳过，别报错
+        #第 1 列叫 scope（范围），存文本，不许留空。
+        #第 2 列叫 category（分类），存文本，不许留空。
+        #第 3 列叫 facts_json（事实 JSON），存文本，不许留空。
+        #第 4 列叫 source_thread_id（来源线程 ID），存文本，可空。
+        #第 5 列叫 updated_at（更新时间），存文本，不许留空。
+
+        #提交事务后，数据库文件才会被写入
+        # 提交建表事务
+        self.conn.commit()
 ```
 
-**调用链**
+**参数**
 
-```text
-LongTermMemoryStore.__init__ -> _init_schema()
-```
+无。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. 数据库连接已关闭 -> sqlite3.ProgrammingError。
-2. 无写权限 -> sqlite3.OperationalError。
+确保表存在。
+
+**数据流举例**
+
+CREATE TABLE IF NOT EXISTS -> commit。
+
+**关键点与边界**
+
+重复调用不会破坏数据。
+
+**伪代码调用示例**
+
+```python
+store._init_schema()
 ```
 
 <a id="func-memory-store-merge_facts"></a>
 #### 4.7.4 merge_facts
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `scope` | `str` | 必填，无默认 | `extract_memory_facts()` 传入 `MEMORY_SCOPE` | 必须与读取 scope 一致 | `"project"` |
-| `category` | `str` | 必填，无默认 | `extract_memory_facts()` 遍历 `CATEGORIES` | 必须与表类别约定一致 | `"user_preferences"` |
-| `facts` | `list` | 必填，无默认 | LLM JSON 中的某类别数组 | 元素会转字符串；空列表直接返回 | `["用户喜欢简洁回答"]` |
-| `source_thread_id` | `str \| None` | 可选，默认 `None` | LangGraph config | 仅记录来源会话 | `"cli-default"` |
-
-**参数详解**
-
-`scope` 和 `category` 定位一条长期记忆记录，`facts` 是本次新增事实。本方法先读取旧事实，按精确文本去重，再保留最近 100 条，最后用 `INSERT ... ON CONFLICT DO UPDATE` 写回。`source_thread_id` 只记录来源，不参与去重。该写入会在下一次 `get_memory_context()` 时体现。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 无 | `None` | 始终 `None` | 写入是副作用 |
-
-**返回详解**
-
-没有返回值；成功会 commit，失败抛异常。调用方是 `extract_memory_facts()`，它不依赖返回值，只希望 Store 状态被更新。
-
-**作用**
-
-```text
-按精确文本去重并追加事实，单类最多 100 条
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
-def merge_facts(
-    self,
-    scope: str,
-    category: str,
-    facts: list,
-    source_thread_id: str | None = None,
-):
-    """追加新事实，按精确文本去重，单类最多保留 100 条。"""
-    if not facts:
-        return
+    def merge_facts(
+        self,
+        scope: str,
+        category: str,
+        facts: list,
+        source_thread_id: str | None = None,
+    ):
+        """追加新事实，按精确文本去重，单类最多保留 100 条。"""
+        # 没有新事实就直接返回，避免空写数据库
+        if not facts:
+            return
 
-    existing = self.get_facts(scope, category)
-    merged = list(existing)
-    for fact in facts:
-        text = str(fact).strip()
-        if text and text not in merged:
-            merged.append(text)
-
-    merged = merged[-MAX_FACTS_PER_CATEGORY:]
-    self.conn.execute(
-        """
-        INSERT INTO long_term_memory (
-            scope,
-            category,
-            facts_json,
-            source_thread_id,
-            updated_at
+        #get_facts 读取数据库里已经存在的旧事实
+        # 读取该类已有事实，作为合并基础
+        existing = self.get_facts(scope, category)
+        #复制旧列表
+        # 复制旧列表，不直接修改数据库读取结果
+        merged = list(existing)
+        #如果事实不为空且不在现有事实中，则添加到merged列表中
+        # 逐条处理新事实
+        for fact in facts:
+            # 事实统一转字符串并去空白
+            text = str(fact).strip()
+            # 按精确文本去重，已有事实不重复加入
+            if text and text not in merged:
+                merged.append(text)
+        #保留最新 MAX_FACTS_PER_CATEGORY 条事实
+        # 单类最多保留 100 条，超过后丢弃最旧事实
+        merged = merged[-MAX_FACTS_PER_CATEGORY:]
+        # 用 upsert 写回 scope+category 这一行
+        self.conn.execute(
+            """
+            INSERT INTO long_term_memory (
+                scope,
+                category,
+                facts_json,
+                source_thread_id,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(scope, category) DO UPDATE SET
+                facts_json = excluded.facts_json,
+                source_thread_id = excluded.source_thread_id,
+                updated_at = excluded.updated_at
+            """,
+            (
+                scope,
+                category,
+                json.dumps(merged, ensure_ascii=False),
+                source_thread_id,
+                self._now(),
+            ),
         )
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(scope, category) DO UPDATE SET
-            facts_json = excluded.facts_json,
-            source_thread_id = excluded.source_thread_id,
-            updated_at = excluded.updated_at
-        """,
-        (
-            scope,
-            category,
-            json.dumps(merged, ensure_ascii=False),
-            source_thread_id,
-            self._now(),
-        ),
-    )
-    self.conn.commit()
+        # 提交写入事务
+        self.conn.commit()
 ```
 
-**调用链**
+**参数**
 
-```text
-extract_memory_facts() -> merge_facts()
-```
+- `scope`, `category`, `facts`, `source_thread_id`。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. facts 为空 -> 直接返回，不写库。
-2. 数据库写入失败 -> sqlite3.Error。
-3. 单类超过 100 条 -> 只保留最后 100 条。
+正常：去重合并写入；边界：facts 为空直接返回。
+
+**数据流举例**
+
+旧 facts + 新 facts -> 去重 -> 保留 100 条 -> upsert。
+
+**关键点与边界**
+
+精确文本去重，单类最多 100 条。
+
+**伪代码调用示例**
+
+```python
+store.merge_facts("project", "entities", ["test2"])
 ```
 
 <a id="func-memory-store-get_facts"></a>
 #### 4.7.5 get_facts
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `scope` | `str` | 必填，无默认 | `merge_facts()` / `get_memory_context()` 传入 | 必须与写入 scope 一致 | `"project"` |
-| `category` | `str` | 必填，无默认 | 同上 | 必须与写入 category 一致 | `"project_facts"` |
-
-**参数详解**
-
-`scope` 和 `category` 共同定位某一类长期记忆。本方法从 `facts_json` 读取并反序列化该类别的事实数组。它只返回精确字符串列表，不做去重或排序；损坏的 JSON 会返回空列表。`merge_facts()` 用它做合并基础，`get_memory_context()` 用它做展示文本。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 示例 |
-| --- | --- | --- | --- |
-| 事实列表 | `list[str]` | 空列表或字符串数组 | `["项目使用 Python"]` |
-
-**返回详解**
-
-返回的是该类别已有事实，保持数据库中的顺序。没有记录、JSON 损坏或 JSON 不是 list 时返回空列表。调用方可以安全假设返回值是 list，不需要判空后检查类型。
-
-**作用**
-
-```text
-读取某类长期记忆；JSON 损坏时返回空列表
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
-def get_facts(self, scope: str, category: str) -> list[str]:
-    row = self.conn.execute(
-        """
-        SELECT facts_json
-        FROM long_term_memory
-        WHERE scope = ? AND category = ?
-        """,
-        (scope, category),
-    ).fetchone()
-    if not row:
-        return []
+    def get_facts(self, scope: str, category: str) -> list[str]:
+        # 按 scope+category 查询一行 facts_json
+        row = self.conn.execute(
+            """
+            SELECT facts_json
+            FROM long_term_memory
+            WHERE scope = ? AND category = ?
+            """,
+            (scope, category),
+        ).fetchone()
+        # 没有记录返回空列表
+        if not row:
+            return []
 
-    try:
-        data = json.loads(row["facts_json"])
-    except json.JSONDecodeError:
-        return []
-
-    if not isinstance(data, list):
-        return []
-    return [str(item) for item in data]
+        # 由共享解析函数统一处理 JSON、非 list 和脏数据
+        return _decode_facts_json(row["facts_json"])
 ```
 
-**调用链**
+**参数**
 
-```text
-merge_facts() / get_memory_context() -> get_facts()
-```
+- `scope`, `category`。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. JSON 损坏 -> 返回空列表，不抛异常。
-2. 数据库连接异常 -> 传播给调用方。
+正常返回字符串列表；无记录或 JSON 损坏返回空列表。
+
+**数据流举例**
+
+scope+category -> SELECT -> _decode_facts_json -> list[str]。
+
+**关键点与边界**
+
+`get_facts` 和 `get_memory_context` 共用 `_decode_facts_json`，损坏数据返回空列表，不抛异常。
+
+**伪代码调用示例**
+
+```python
+store.get_facts("project", "entities")
+# 返回 ["test2"] 或 []
 ```
 
 <a id="func-memory-store-get_memory_context"></a>
 #### 4.7.6 get_memory_context
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `scope` | `str` | 可选，默认 `"project"` | `build_long_term_memory_section()` 调用 | 必须与写入 scope 一致 | `"project"` |
-
-**参数详解**
-
-`scope` 标识记忆作用域，决定读取哪些行。本方法读取该 scope 下所有类别，按类别字母序组织成多段文本；每个类别下的事实列表会拼成 `- 事实` 格式。返回文本直接适合放进 `SystemMessage`，是图面代码最终消费的长期记忆格式。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 示例 |
-| --- | --- | --- | --- |
-| 记忆文本 | `str` | 空字符串或多行文本 | `"user_preferences:\n- 用户喜欢简洁回答"` |
-
-**返回详解**
-
-返回的字符串不是原始 JSON，而是给 LLM 看的自然语言文本。空字符串表示没有记忆；非空时按类别分段，中间用空行分隔。调用方是 `build_long_term_memory_section()`，它会包成 `SystemMessage`。
-
-**作用**
-
-```text
-把长期记忆格式化成可注入 SystemMessage 的文本
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
-def get_memory_context(self, scope: str = MEMORY_SCOPE) -> str:
-    """返回按类别组织好的长期记忆文本。"""
-    rows = self.conn.execute(
-        """
-        SELECT category
-        FROM long_term_memory
-        WHERE scope = ?
-        ORDER BY category
-        """,
-        (scope,),
-    ).fetchall()
+    def get_memory_context(self, scope: str = MEMORY_SCOPE) -> str:
+        """返回按类别组织好的长期记忆文本。"""
+        # 一次查询该 scope 下所有类别和 facts_json，避免逐类别二次查询
+        rows = self.conn.execute(
+            """
+            SELECT category, facts_json
+            FROM long_term_memory
+            WHERE scope = ?
+            ORDER BY category
+            """,
+            (scope,),
+        ).fetchall()
 
-    parts = []
-    for row in rows:
-        category = row["category"]
-        facts = self.get_facts(scope, category)
-        if facts:
-            parts.append(f"{category}:\n- " + "\n- ".join(facts))
-    return "\n\n".join(parts)
+        parts = []
+        for row in rows:
+            category = row["category"]
+            # 用共享解析函数读取该类别事实
+            facts = _decode_facts_json(row["facts_json"])
+            # 只把非空类别拼进最终上下文
+            if facts:
+                # 格式化为 “类别:
+- 事实” 的 LLM 可读文本
+                parts.append(f"{category}:\n- " + "\n- ".join(facts))
+        return "\n\n".join(parts)
 ```
 
-**调用链**
+**参数**
 
-```text
-build_long_term_memory_section() -> get_memory_context()
-```
+- `scope`: 默认 project。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. 数据库连接异常 -> 传播给调用方。
-2. 某个类别 JSON 损坏 -> 该类别被跳过，不抛异常。
+正常返回多类别记忆文本；无记忆返回空字符串。
+
+**数据流举例**
+
+scope -> 一次 SELECT category+facts_json -> 按类别格式化文本。
+
+**关键点与边界**
+
+一次 SQL 读取全部类别与事实，避免原来的 1+N 查询；输出适合直接放入 SystemMessage。
+
+**伪代码调用示例**
+
+```python
+store.get_memory_context("project")
 ```
 
 <a id="func-memory-store-clear_scope"></a>
 #### 4.7.7 clear_scope
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `scope` | `str` | 可选，默认 `"project"` | 手动调用或管理工具 | 只删除该 scope 的行 | `"project"` |
-
-**参数详解**
-
-`scope` 指定要清空的记忆作用域。本方法会删除该 scope 下的所有类别记录，但不会删除其他 scope。当前图流程不调用它，它主要用于测试或管理长期记忆。清空后 `get_memory_context()` 会返回空字符串。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 无 | `None` | 始终 `None` | 删除副作用 |
-
-**返回详解**
-
-没有返回值；成功会 commit。调用方不需要读取结果，只要确认删除后的读取为空即可。
-
-**作用**
-
-```text
-清空指定作用域的长期记忆
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
-def clear_scope(self, scope: str = MEMORY_SCOPE):
-    self.conn.execute(
-        "DELETE FROM long_term_memory WHERE scope = ?",
-        (scope,),
-    )
-    self.conn.commit()
+    def clear_scope(self, scope: str = MEMORY_SCOPE):
+        # 删除指定 scope 的全部长期记忆行
+        self.conn.execute(
+            "DELETE FROM long_term_memory WHERE scope = ?",
+            (scope,),
+        )
+        # 提交删除事务
+        self.conn.commit()
 ```
 
-**调用链**
+**参数**
 
-```text
-当前图运行流程不调用；可手动用于测试或管理
-```
+- `scope`: 默认 project。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. scope 为空字符串时仍可删除该空 scope 行。
-2. 数据库异常 -> 传播给调用方。
+删除指定 scope 全部长期记忆。
+
+**数据流举例**
+
+DELETE FROM long_term_memory WHERE scope=? -> commit。
+
+**关键点与边界**
+
+不影响其他 scope。
+
+**伪代码调用示例**
+
+```python
+store.clear_scope("project")
 ```
 
 <a id="func-memory-store-close"></a>
 #### 4.7.8 close
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 |
-| --- | --- | --- | --- | --- |
-| 无 | - | - | - | - |
-
-**参数详解**
-
-本方法关闭 `LongTermMemoryStore` 持有的 SQLite 连接，是 Store 生命周期的结束动作。调用后不能再执行查询或写入，否则会抛 `ProgrammingError`。`AgentRuntime.close()` 会调用它，确保运行时退出时释放数据库资源。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 无 | `None` | 始终 `None` | 关闭副作用 |
-
-**返回详解**
-
-没有返回值；成功表现为连接被关闭。调用方应确保没有后续数据库操作。
-
-**作用**
-
-```text
-关闭 SQLite 连接
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
-def close(self):
-    self.conn.close()
+    def close(self):
+        # 关闭 SQLite 连接，释放资源
+        self.conn.close()
 ```
 
-**调用链**
+**参数**
 
-```text
-AgentRuntime.close() -> memory_store.close()
-```
+无。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. 连接已关闭时重复 close -> sqlite3.ProgrammingError。
-2. 关闭后继续读写 -> 抛异常。
+关闭 SQLite 连接。
+
+**数据流举例**
+
+conn.close()。
+
+**关键点与边界**
+
+关闭后不能继续读写。
+
+**伪代码调用示例**
+
+```python
+store.close()
 ```
 
 <a id="func-memory-store-now"></a>
 #### 4.7.9 _now
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 |
-| --- | --- | --- | --- | --- |
-| 无 | - | - | - | - |
-
-**参数详解**
-
-本方法是静态工具函数，不访问实例状态，只生成当前 UTC 时间的 ISO 格式字符串。它用于 `merge_facts()` 的 `updated_at` 字段，帮助判断记忆最后更新时间。使用 UTC 避免不同时区写入时间不一致。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 示例 |
-| --- | --- | --- | --- |
-| 时间戳 | `str` | ISO 8601 UTC 字符串 | `"2026-08-10T12:00:00+00:00"` |
-
-**返回详解**
-
-返回的时间字符串会写入 SQLite `updated_at` 列。调用方不直接读取它；未来可以通过该字段追踪记忆更新时间。
-
-**作用**
-
-```text
-生成 updated_at 时间戳
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
-@staticmethod
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    @staticmethod
+    def _now() -> str:
+        # 生成 UTC ISO 时间，避免不同时区写入时间不一致
+        return datetime.now(timezone.utc).isoformat()
 ```
 
-**调用链**
+**参数**
 
-```text
-merge_facts() -> _now()
-```
+无。
 
-**失败模式**
+**整体执行场景**
 
-```text
-无输入，因此没有用户输入相关失败。
+生成 UTC ISO 时间戳。
+
+**数据流举例**
+
+datetime.now(timezone.utc).isoformat()。
+
+**关键点与边界**
+
+用于 updated_at。
+
+**伪代码调用示例**
+
+```python
+LongTermMemoryStore._now()
 ```
 
 <a id="module-runtime"></a>
@@ -2831,37 +2468,7 @@ merge_facts() -> _now()
 <a id="class-runtime-agent_runtime"></a>
 #### 4.8.1 AgentRuntime
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `app` | `object` | 必填，无默认 | `build_graph()` 返回值 | 必须是可 `stream()` / `invoke()` 的 LangGraph app | `CompiledStateGraph` |
-| `checkpointer` | `SqliteSaver` | 必填，无默认 | `create_runtime()` 创建 | 必须支持 `delete_thread()` | `SqliteSaver(conn)` |
-| `memory_store` | `LongTermMemoryStore` | 必填，无默认 | `create_runtime()` 创建 | 必须实现 `MemoryStore` 接口并有 `close()` | `LongTermMemoryStore(path)` |
-| `db_path` | `Path` | 必填，无默认 | `create_runtime()` 计算 | 必须是实际 SQLite 路径 | `Path("data/memory.db")` |
-| `conn` | `sqlite3.Connection` | 必填，无默认 | `create_runtime()` 创建 | 必须保持打开；`close()` 后不可用 | `sqlite3.connect(path)` |
-
-**参数详解**
-
-`app` 是 CLI/Web 实际运行的编译图，代表完整的 ReAct Agent。`checkpointer` 负责保存每个 `thread_id` 的对话 checkpoint，支撑多轮记忆和 `clear` 操作。`memory_store` 是项目级长期记忆的 SQLite 实现，负责跨会话读取和写入用户偏好、项目事实。`db_path` 和 `conn` 描述同一个数据库：前者是文件路径，后者是打开中的连接。这个 dataclass 的意义是把“图、checkpoint、长期记忆、数据库”组装成一个共享运行时，避免入口重复创建。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 运行时 | `AgentRuntime` | 持有 app 和依赖的实例 | CLI/Web 的共享入口对象 |
-
-**返回详解**
-
-返回的 `AgentRuntime` 会被 `create_runtime()` 构造，并由 CLI/Web 持有。入口通过 `runtime.app` 运行图，通过 `runtime.checkpointer` 清空会话，通过 `runtime.memory_store` 管理长期记忆。生命周期结束时可以调用 `runtime.close()` 释放 SQLite 连接。
-
-**作用**
-
-```text
-保存一个 Agent 实例及其共享依赖
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 @dataclass
@@ -2880,102 +2487,68 @@ class AgentRuntime:
         self.conn.close()
 ```
 
-**调用链**
+**参数**
 
-```text
-create_runtime() -> AgentRuntime
-CLI/Web -> runtime.app / runtime.checkpointer
-```
+- `app`, `checkpointer`, `memory_store`, `db_path`, `conn`。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. conn 已关闭 -> 后续 checkpoint/Store 操作失败。
-2. app 未编译 -> 入口无法 stream。
+由 create_runtime 构造，CLI/Web 共享。
+
+**数据流举例**
+
+create_runtime -> AgentRuntime -> runtime.app / checkpointer / memory_store。
+
+**关键点与边界**
+
+close 会关闭 memory_store 和 conn。
+
+**伪代码调用示例**
+
+```python
+runtime = create_runtime("ollama")
 ```
 
 <a id="func-runtime-close"></a>
 #### 4.8.2 close
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 |
-| --- | --- | --- | --- | --- |
-| 无 | - | - | - | - |
-
-**参数详解**
-
-本方法没有参数，只负责关闭运行时持有的 SQLite 资源。它先关闭 `LongTermMemoryStore` 的连接，再关闭 `SqliteSaver` 使用的同一个 `conn`。调用后不能再通过该 runtime 运行图或读写记忆；它是进程退出或服务关闭时的清理入口。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 无 | `None` | 始终 `None` | 释放连接 |
-
-**返回详解**
-
-没有返回值；成功表现为 SQLite 连接被关闭。当前 CLI/Web 没有自动调用，但未来接入生命周期管理时可以复用。
-
-**作用**
-
-```text
-关闭 memory store 和 SqliteSaver 共用的 SQLite 连接
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
-def close(self):
-    """关闭运行时持有的 SQLite 连接。"""
-    self.memory_store.close()
-    self.conn.close()
+    def close(self):
+        """关闭运行时持有的 SQLite 连接。"""
+        # 先关闭长期记忆 Store 的连接
+        self.memory_store.close()
+        # 再关闭 SqliteSaver 共用的 SQLite 连接
+        self.conn.close()
 ```
 
-**调用链**
+**参数**
 
-```text
-CLI/Web 生命周期结束时可以调用；当前入口未自动调用
-```
+无。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. 重复 close -> sqlite3.ProgrammingError。
-2. close 后继续使用 runtime -> 数据库操作失败。
+关闭所有 SQLite 连接。
+
+**数据流举例**
+
+memory_store.close() -> conn.close()。
+
+**关键点与边界**
+
+重复 close 可能报错。
+
+**伪代码调用示例**
+
+```python
+runtime.close()
 ```
 
 <a id="func-runtime-create_runtime"></a>
 #### 4.8.3 create_runtime
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `provider` | `str` | 可选，默认 `"anthropic"` | CLI/Web 从 `.env` 或参数传入 | 必须能在 `providers.toml` 查到 | `"ollama"` |
-| `db_path` | `str \| Path \| None` | 可选，默认 `DEFAULT_DB_PATH` | 调用方显式传入或省略 | 父目录不存在会自动创建 | `"data/memory.db"` |
-
-**参数详解**
-
-`provider` 决定创建哪家 LLM，和 `build_graph()` 的 provider 相同；CLI/Web 从 `.env` 读取后传入。`db_path` 决定对话 checkpoint 和长期记忆的 SQLite 文件位置；省略时使用项目根目录 `data/memory.db`。本函数会创建数据库连接、`SqliteSaver`、`LongTermMemoryStore` 和编译后的图，再打包成 `AgentRuntime`。它是唯一允许产生数据库文件系统副作用的组合入口。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 运行时 | `AgentRuntime` | 已包含 app 和依赖 | CLI/Web 可直接运行 |
-
-**返回详解**
-
-返回的 `AgentRuntime` 是完整可运行组合体。`runtime.app` 用于 stream，`runtime.checkpointer` 用于 clear，`runtime.memory_store` 用于长期记忆。返回后调用方不需要再单独组装任何依赖。
-
-**作用**
-
-```text
-创建 SQLite 连接、SqliteSaver、LongTermMemoryStore 和编译后的图
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def create_runtime(
@@ -2983,17 +2556,24 @@ def create_runtime(
     db_path: str | Path | None = None,
 ) -> AgentRuntime:
     """显式创建 Agent 运行时，不在模块 import 阶段产生文件系统副作用。"""
+    # 没有显式 db_path 就用 data/memory.db
     path = Path(db_path or DEFAULT_DB_PATH)
+    # 创建 data 目录，避免数据库连接失败
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    # 打开 SQLite 连接
     conn = sqlite3.connect(str(path), check_same_thread=False)
+    # 创建多轮对话 checkpointer
     checkpointer = SqliteSaver(conn)
+    # 创建项目级长期记忆 Store
     memory_store = LongTermMemoryStore(path)
+    # 组装并编译 LangGraph 图
     app = build_graph(
         provider,
         checkpointer=checkpointer,
         memory_store=memory_store,
     )
+    # 把所有共享依赖打包成 AgentRuntime
     return AgentRuntime(
         app=app,
         checkpointer=checkpointer,
@@ -3002,27 +2582,28 @@ def create_runtime(
         conn=conn,
     )
 ```
-memory_store就是长期记忆的"管家对象"：第 39 行把它造出来（顺便连好数据库、建好表），之后整个应用通过它读记忆、写记忆，程序结束时通过它关连接。它在 runtime.py 里被创建一次，然后分发给图的各个节点共享使用
-memory_store 提供的能力：
 
-  get_memory_context(scope)   → 读：把长期记忆格式化成文本（memory.py 第 85 行用的）
-  merge_facts(...)            → 写：去重、限量、upsert 存事实（extract 时用的）
-  close()                     → 关：释放 SQLite 连接（AgentRuntime.close() 用的）
+**参数**
 
-**调用链**
+- `provider`: 默认 anthropic。
+- `db_path`: 可选。
 
-```text
-__main__.main() -> create_runtime(provider)
-web.get_runtime() -> create_runtime(provider)
-```
+**整体执行场景**
 
-**失败模式**
+正常：组合完整 runtime；异常：provider 无效。
 
-```text
-1. 默认 db_path 是 data/memory.db。
-2. 会创建 data/ 目录。
-3. 不再在 import 阶段执行。
-4. provider 无效时 get_llm() 抛 ValueError。
+**数据流举例**
+
+provider/db_path -> SqliteSaver + LongTermMemoryStore + build_graph -> AgentRuntime。
+
+**关键点与边界**
+
+只在 create_runtime 阶段产生数据库副作用。
+
+**伪代码调用示例**
+
+```python
+runtime = create_runtime("ollama", db_path="data/memory.db")
 ```
 
 <a id="module-agent-session"></a>
@@ -3033,37 +2614,12 @@ web.get_runtime() -> create_runtime(provider)
 <a id="func-agent-session-initial_state"></a>
 #### 4.9.1 initial_state
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `user_message` | `str` | 必填，无默认 | CLI 的 `input()` 或 Web 请求体 `message` | 不能为 `None`；空字符串会生成空 HumanMessage | `"北京天气怎么样？"` |
-
-**参数详解**
-
-`user_message` 是用户本轮输入，代表需要 Agent 处理的原始问题。本函数会把它包装成 `HumanMessage` 放入 `messages`，同时设置 `summary=""`、`should_act=False`、`tool_calls=[]`、`iteration=0`。该 state 会传给 `app.stream()`，LangGraph 会在此基础上追加后续节点消息。`thought` 也保留为空字符串，作为历史遗留字段但不属于正式 `ReActState`。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 初始 state | `dict` | 包含 messages 和全部初始字段 | `app.stream()` 的输入 |
-
-**返回详解**
-
-返回 dict 是 LangGraph 第一次调用图时的初始状态。`messages` 包含用户消息，`should_act`/`tool_calls`/`iteration` 都从安全初始值开始，`summary` 为空以配合 `keep_existing_summary`。CLI 和 Web 都通过它避免重复构造状态。
-
-**作用**
-
-```text
-构造一轮对话的初始 state
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def initial_state(user_message: str) -> dict:
     """Build the initial ReActState values for a new user turn."""
+    # 构造一轮对话的初始 state，messages 放入 HumanMessage
     return {
         "messages": [HumanMessage(content=user_message)],
         "thought": "",
@@ -3074,50 +2630,32 @@ def initial_state(user_message: str) -> dict:
     }
 ```
 
-**调用链**
+**参数**
 
-```text
-stream_updates() -> initial_state()
-```
+- `user_message`: 用户消息字符串。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. user_message 为 None -> HumanMessage 构造失败。
-2. 空字符串 -> 仍可构造，但 LLM 可能无意义。
+构造一轮对话初始 state。
+
+**数据流举例**
+
+user_message -> HumanMessage + 空字段 -> state。
+
+**关键点与边界**
+
+thought 是历史遗留字段。
+
+**伪代码调用示例**
+
+```python
+initial_state("你好")
 ```
 
 <a id="func-agent-session-session_config"></a>
 #### 4.9.2 session_config
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `thread_id` | `str` | 必填，无默认 | CLI 固定 `"cli-default"`；Web 使用 `session_id` | 不能为空；不同 id 隔离 checkpoint | `"session-123"` |
-| `recursion_limit` | `int \| None` | 可选，默认 `MAX_ITERATIONS * 6` | 调用方显式传入或省略 | 必须为正整数 | `210` |
-
-**参数详解**
-
-`thread_id` 是 LangGraph 会话标识，决定多轮记忆存在哪个 checkpoint；同一 id 连续对话共享上下文，不同 id 互不可见。`recursion_limit` 是图遍历深度上限，防止 ReAct 长循环误触 LangGraph 递归限制；默认值根据最大迭代次数计算，CLI/Web 无需重复维护。本函数返回的 config 会传给 `app.stream()`。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| config | `dict` | 包含 `recursion_limit` 和 `configurable.thread_id` | `app.stream()` 的 config 参数 |
-
-**返回详解**
-
-返回 dict 是 LangGraph 运行配置，调用方 `stream_updates()` 原样传入 `app.stream()`。`configurable.thread_id` 控制记忆会话，`recursion_limit` 控制递归深度；两者都不进入 state。
-
-**作用**
-
-```text
-统一构造 thread_id 和 recursion_limit
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def session_config(
@@ -3125,6 +2663,7 @@ def session_config(
     recursion_limit: int | None = None,
 ) -> dict:
     """Build LangGraph config for a thread, with a safe recursion limit."""
+    # 返回 LangGraph config：thread_id 控制会话记忆，recursion_limit 防止长循环
     return {
         "recursion_limit": MAX_ITERATIONS * 6
         if recursion_limit is None
@@ -3133,52 +2672,33 @@ def session_config(
     }
 ```
 
-**调用链**
+**参数**
 
-```text
-stream_updates() -> session_config()
-```
+- `thread_id`: 会话 ID。
+- `recursion_limit`: 可选，默认 MAX_ITERATIONS * 6。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. thread_id 为空 -> LangGraph 可能无法区分会话。
-2. recursion_limit 过小 -> 长工具循环触发 GraphRecursionError。
+生成 LangGraph config。
+
+**数据流举例**
+
+thread_id/recursion_limit -> config dict。
+
+**关键点与边界**
+
+thread_id 决定记忆隔离。
+
+**伪代码调用示例**
+
+```python
+session_config("thread-1")
 ```
 
 <a id="func-agent-session-stream_updates"></a>
 #### 4.9.3 stream_updates
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `app` | LangGraph app | 必填，无默认 | CLI/Web 从 `runtime.app` 获取 | 必须有 `stream()` 方法 | `CompiledStateGraph` |
-| `user_message` | `str` | 必填，无默认 | CLI/Web 请求输入 | 同 `initial_state()` 约束 | `"北京天气怎么样？"` |
-| `thread_id` | `str` | 必填，无默认 | CLI/Web 会话 id | 同 `session_config()` 约束 | `"cli-default"` |
-| `recursion_limit` | `int \| None` | 可选，默认自动 | 调用方显式传入或省略 | 同 `session_config()` 约束 | `210` |
-
-**参数详解**
-
-`app` 是要运行的编译图，`user_message` 是本次输入，`thread_id` 是会话标识；三个参数共同决定一次流式对话从哪里开始、属于哪个会话。本函数调用 `app.stream(stream_mode="updates")`，并把每个原始 step dict 扁平化成 `(node_name, update)`。CLI 可以 `list()` 收集，Web 可以边收边发 SSE，因此它是两个入口共享的核心 runner。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 更新流 | `Iterator[(node_name, update)]` | 逐节点 yield | 扁平化 LangGraph 节点更新 |
-
-**返回详解**
-
-每个元素是 `(node_name, update)`，其中 `node_name` 是 `think`/`act`/`observe`/`extract`，`update` 是该节点返回的状态增量。CLI 用列表收集后统计 `observe` 轮数和最终答案；Web 用同一个流生成 SSE `node` 事件。
-
-**作用**
-
-```text
-统一调用 app.stream(stream_mode="updates")，并把每个 step 扁平化为 (node, update)
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def stream_updates(
@@ -3188,59 +2708,44 @@ def stream_updates(
     recursion_limit: int | None = None,
 ) -> Iterator[tuple[str, dict]]:
     """Stream LangGraph updates as flattened (node_name, update) pairs."""
+    # 调用 LangGraph updates 模式，逐个拿到节点 step
     for step in app.stream(
         initial_state(user_message),
         config=session_config(thread_id, recursion_limit),
         stream_mode="updates",
     ):
+        # 把原始 step dict 扁平化为 (node_name, update)
         for node_name, update in step.items():
+            # 逐个 yield，让 CLI/Web 保持流式能力
             yield node_name, update
 ```
 
-**调用链**
+**参数**
 
-```text
-CLI main() -> stream_updates(app, user_input, THREAD_ID)
-Web chat.gen() -> stream_updates(get_agent(), user_input, session_id)
-```
+- `app`, `user_message`, `thread_id`, `recursion_limit`。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. app.stream() 抛异常 -> 生成器在迭代时抛给调用方。
-2. thread_id 错误 -> checkpoint 可能串会话。
+流式扁平化节点更新。
+
+**数据流举例**
+
+app.stream -> step -> (node_name, update) yield。
+
+**关键点与边界**
+
+CLI list 收集，Web 边收边发 SSE。
+
+**伪代码调用示例**
+
+```python
+list(stream_updates(app, "你好", "thread-1"))
 ```
 
 <a id="func-agent-session-collect_messages"></a>
 #### 4.9.4 collect_messages
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `updates` | `Iterable[(node_name, update)]` | 必填，无默认 | `stream_updates()` 的结果 | 必须可迭代；update 应含 `messages` 键 | `[("think", {"messages": [...]})]` |
-
-**参数详解**
-
-`updates` 是扁平节点更新流，代表一次对话过程中所有节点返回的状态增量。本函数只关心每个 update 的 `messages` 字段，把所有新增消息按顺序合并成一个列表。它不负责还原 checkpoint 中的历史，只收集本轮输出。CLI 用它给最终答案和日志提供消息来源。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 消息列表 | `list[BaseMessage]` | 空列表或所有节点消息 | 本轮产生的全部消息 |
-
-**返回详解**
-
-返回的是按节点执行顺序排列的消息列表，包括 `AIMessage`、`ToolMessage`、可能的 `RemoveMessage`。它直接对应 CLI 的日志打印输入；Web 不直接使用它，而是自行收集扁平 payload。
-
-**作用**
-
-```text
-从扁平 updates 中收集 messages
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def collect_messages(
@@ -3249,134 +2754,114 @@ def collect_messages(
     """Collect all message updates from flattened session updates."""
     messages: list[BaseMessage] = []
     for _, update in updates:
+        # 把每个节点返回的消息追加到统一列表
         messages.extend(update.get("messages", []))
     return messages
 ```
 
-**调用链**
+**参数**
 
-```text
-CLI main() -> collect_messages(updates)
-```
+- `updates`: (node, update) 可迭代对象。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. updates 不可迭代 -> TypeError。
-2. update 没有 messages 键 -> 跳过该节点。
+收集所有节点消息。
+
+**数据流举例**
+
+updates -> update["messages"] -> list。
+
+**关键点与边界**
+
+不还原 checkpoint 历史。
+
+**伪代码调用示例**
+
+```python
+collect_messages(updates)
 ```
 
 <a id="func-agent-session-final_answer"></a>
 #### 4.9.5 final_answer
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `updates` | `Iterable[(node_name, update)]` | 必填，无默认 | `stream_updates()` 的结果 | 必须可被 `list()` 反转；消息需可访问 `content`/`tool_calls` | `[("think", {"messages": [AIMessage(...)]})]` |
-
-**参数详解**
-
-`updates` 是本次对话的节点更新流，代表最终答案候选所在的消息序列。本函数从后往前查找最后一个“非工具调用、有内容”的 `AIMessage`，避免把带 `tool_calls` 的中间思考或 ToolMessage 当成最终回答。CLI 用它打印最终回复，Web 用它发送 `final` SSE 事件。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 最终答案 | `str` | AI 内容或 `"（无最终回复）"` | 用户可读的最终回答 |
-
-**返回详解**
-
-返回字符串直接用于展示。如果消息内容不是 `str`，会先转成字符串再判断非空；如果找不到合适 AIMessage，则返回 `"（无最终回复）"`。它不修改状态，也不影响 checkpoint。
-
-**作用**
-
-```text
-统一 CLI/Web 的最终答案提取规则
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def final_answer(updates: Iterable[tuple[str, dict]]) -> str:
     """Return the last non-tool-call AIMessage with non-empty content."""
+    # 从最后节点往前找，保证取到最终答案
     for _, update in reversed(list(updates)):
+        # 从每个节点消息里倒序找 AI 回复
         for msg in reversed(update.get("messages", [])):
+            # 消息内容可能是 str 或 list，统一转字符串
             content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            # 只接受非工具调用、非空内容的 AIMessage
             if (
                 isinstance(msg, AIMessage)
                 and content.strip()
                 and not getattr(msg, "tool_calls", None)
             ):
+                # 找到最终答案后直接返回
                 return content
+    # 所有消息都不是最终答案时返回兜底文本
     return "（无最终回复）"
 ```
 
-**调用链**
+**参数**
 
-```text
-CLI main() -> final_answer(updates)
-Web chat.gen() -> final_answer(updates)
-```
+- `updates`: (node, update) 可迭代对象。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. 跳过带 tool_calls 的 AI 消息。
-2. 没有最终答案时返回 "（无最终回复）"。
-3. updates 为生成器且已消费 -> 反转空列表，返回 fallback。
+正常找到最终回复；边界无最终回复返回兜底。
+
+**数据流举例**
+
+倒序遍历 updates -> 找非工具 AI 消息 -> 返回内容。
+
+**关键点与边界**
+
+跳过 tool_calls，避免把中间思考当最终答案。
+
+**伪代码调用示例**
+
+```python
+final_answer(updates)
+# 返回 "最终回复"
 ```
 
 <a id="func-agent-session-clear_thread"></a>
 #### 4.9.6 clear_thread
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `runtime` | `AgentRuntime` | 必填，无默认 | CLI/Web 当前 runtime | 必须有 `checkpointer` | `AgentRuntime(...)` |
-| `thread_id` | `str` | 必填，无默认 | CLI 固定 id 或 Web session_id | 不能为空 | `"cli-default"` |
-
-**参数详解**
-
-`runtime` 是持有 `SqliteSaver` 的运行时，`thread_id` 是要清空的会话。本函数调用 `checkpointer.delete_thread()`，删除该会话的对话 checkpoint，但不删除项目级长期记忆。CLI 的 `clear` 和 Web 的 `/api/clear` 都复用它，保证清空行为一致。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 无 | `None` | 始终 `None` | 删除会话历史 |
-
-**返回详解**
-
-没有返回值；成功表现为该 `thread_id` 的 checkpoint 被删除，下次同一会话从空历史开始。长期记忆仍保留，因为本项目设计为“清空对话，不重置项目记忆”。
-
-**作用**
-
-```text
-封装 checkpointer.delete_thread()
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def clear_thread(runtime, thread_id: str) -> None:
     """Clear the checkpoint history for one thread."""
+    # 删除指定 thread 的 checkpoint，但不清长期记忆
     runtime.checkpointer.delete_thread(thread_id)
 ```
 
-**调用链**
+**参数**
 
-```text
-CLI clear 命令 -> clear_thread(runtime, THREAD_ID)
-Web /api/clear -> clear_thread(get_runtime(), session_id)
-```
+- `runtime`, `thread_id`。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. thread_id 不存在 -> delete_thread 通常无副作用。
-2. runtime 未初始化 -> AttributeError。
+删除对话 checkpoint，不清长期记忆。
+
+**数据流举例**
+
+runtime.checkpointer.delete_thread(thread_id)。
+
+**关键点与边界**
+
+CLI/Web 共用。
+
+**伪代码调用示例**
+
+```python
+clear_thread(runtime, "thread-1")
 ```
 
 <a id="module-main"></a>
@@ -3387,34 +2872,7 @@ Web /api/clear -> clear_thread(get_runtime(), session_id)
 <a id="func-main-print_react_log"></a>
 #### 4.10.1 print_react_log
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `messages` | 消息列表 | 必填，无默认 | `collect_messages()` 的结果 | 必须可遍历；消息需有 `content` 等字段 | `[AIMessage(...), ToolMessage(...)]` |
-| `iteration` | `int` | 必填，无默认 | CLI 统计的 observe 轮数 | 非负整数 | `2` |
-
-**参数详解**
-
-`messages` 是本轮全部消息，`iteration` 是已执行轮数；两者用于打印 ReAct 过程日志。本函数通过 `tool_calls` 判断 Think 节点，通过 `ToolMessage` 判断 Observe 节点。当前 `main()` 已注释该函数，但它仍保留作为另一种日志视图。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 无 | `None` | 始终 `None` | 直接打印到终端 |
-
-**返回详解**
-
-没有返回值；输出是终端过程日志。调用方不会基于返回值做任何判断。
-
-**作用**
-
-```text
-按 Think / Act / Observe 打印过程日志
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def print_react_log(messages, iteration):
@@ -3424,7 +2882,9 @@ def print_react_log(messages, iteration):
     print(f"{'='*50}")
 
     turn = 0
+    # 遍历消息，根据类型识别 Think/Act/Observe
     for msg in messages:
+        # 带 tool_calls 的 AIMessage 是 Think
         if hasattr(msg, "tool_calls") and msg.tool_calls:
             turn += 1
             thought = msg.content or "(请求调用工具)"
@@ -3432,61 +2892,47 @@ def print_react_log(messages, iteration):
             for tc in msg.tool_calls:
                 print(f"  ⚡ [Act] 调用 {tc['name']}({tc['args']})")
 
+        # ToolMessage 是 Observe
         elif msg.__class__.__name__ == "ToolMessage":
             content = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
             print(f"  👁️  [Observe] {content}")
 ```
 
-**调用链**
+**参数**
 
-```text
-当前 main() 中已注释，保留作为过程日志实现
-```
+- `messages`, `iteration`。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. messages 中消息缺少 content/tool_calls -> AttributeError。
-2. iteration 不是数值 -> 打印字符串时格式错误。
+按 Think/Observe 打印日志。
+
+**数据流举例**
+
+messages -> 类型判断 -> print。
+
+**关键点与边界**
+
+当前 main 中已注释，保留备用。
+
+**伪代码调用示例**
+
+```python
+print_react_log(messages, 2)
 ```
 
 <a id="func-main-print_state_changes"></a>
 #### 4.10.2 print_state_changes
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `updates` | `Iterable[(node_name, update)]` | 必填，无默认 | `stream_updates()` 的结果 | 必须可枚举；update 是 dict | `[("think", {"messages": [...]})]` |
-
-**参数详解**
-
-`updates` 是扁平节点更新流，代表每一步 LangGraph 状态变化。本函数逐个打印节点名和字段值，`messages` 特殊展开成 `+ MessageType: content`，其他字段直接打印值。CLI 用它把 Agent 的思考、工具调用和观察过程完整展示给用户。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 无 | `None` | 始终 `None` | 打印日志 |
-
-**返回详解**
-
-没有返回值；输出是调试/过程日志。它不修改 state，也不影响 Agent 运行结果。
-
-**作用**
-
-```text
-打印每个节点每次的 state 更新
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def print_state_changes(updates):
     """打印每一步 state 变化（stream_mode="updates" 捕获的记录）"""
+    # 遍历扁平节点更新，逐个打印
     for i, (node_name, update) in enumerate(updates, 1):
         print(f"\n─── 第 {i} 步 · {node_name} 节点 ───")
         for key, value in update.items():
+            # messages 特殊展开成 + MessageType 格式
             if key == "messages":
                 for msg in value:
                     print(f"  + {msg.__class__.__name__}: {str(msg.content)[:250]}")
@@ -3497,53 +2943,37 @@ def print_state_changes(updates):
                 print(f"  {key}: {value}")
 ```
 
-**调用链**
+**参数**
 
-```text
-CLI main() -> print_state_changes(updates)
-```
+- `updates`: (node, update) 可迭代对象。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. updates 不可迭代 -> TypeError。
-2. 消息没有 content -> AttributeError。
+逐节点打印状态变化。
+
+**数据流举例**
+
+updates -> 打印 node -> 打印 messages/其他字段。
+
+**关键点与边界**
+
+messages 特殊展开，其他字段直接打印。
+
+**伪代码调用示例**
+
+```python
+print_state_changes(updates)
 ```
 
 <a id="func-main-main"></a>
 #### 4.10.3 main
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 |
-| --- | --- | --- | --- | --- |
-| 无显式参数 | - | - | 从 `.env` 和环境变量读取配置，从 stdin 读取用户输入 | 必须配置 `LLM_PROVIDER` 等 |
-
-**参数详解**
-
-`main()` 没有函数参数，但它的输入来自两类外部源：环境变量决定 provider/model，`input()` 决定用户消息。它负责创建 `create_runtime()`、进入交互循环、识别 `quit`/`exit`/`clear`、调用 `stream_updates()` 并打印结果。该函数是 CLI 的入口和胶水层，不包含图逻辑。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 无 | `None` | 通常退出进程 | CLI 主流程结束 |
-
-**返回详解**
-
-函数正常退出时返回 `None`；初始化失败时调用 `sys.exit(1)`。它不返回 Agent 结果，结果通过终端打印输出。
-
-**作用**
-
-```text
-CLI 交互主循环：初始化运行时、处理输入、运行 Agent、打印结果
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def main():
     # 读取 provider：从 .env 环境变量
+    # 从 .env 读取供应商，默认 anthropic
     provider = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
 
     model = os.getenv("LLM_MODEL", "")
@@ -3552,6 +2982,7 @@ def main():
 
     # 构建运行时
     try:
+        # 创建完整运行时，失败时打印配置提示并退出
         runtime = create_runtime(provider)
         app = runtime.app
     except Exception as e:
@@ -3569,6 +3000,7 @@ def main():
     # 交互循环
     while True:
         try:
+            # 读取用户输入并去空白
             user_input = input("你: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n👋 再见！")
@@ -3579,6 +3011,7 @@ def main():
         if user_input.lower() in ("quit", "exit", "q"):
             print("👋 再见！")
             break
+        # clear 命令清空当前 thread checkpoint
         if user_input.lower() in ("clear", "/clear"):
             clear_thread(runtime, THREAD_ID)
             print("\n🧹 已清空当前会话记忆")
@@ -3586,6 +3019,7 @@ def main():
 
         # 运行 Agent（stream 模式：逐步捕获 state 变化）
         try:
+            # 收集本轮所有节点更新
             updates = list(stream_updates(app, user_input, THREAD_ID))
         except Exception as e:
             print(f"\n❌ 运行出错: {e}")
@@ -3595,11 +3029,13 @@ def main():
         all_messages = collect_messages(updates)
 
         # 打印最终回复
+        # 从节点更新里提取最终回复
         final_content = final_answer(updates)
         if final_content and final_content != "（无最终回复）":
             print(f"\n📎 {final_content}")
 
         # 统计轮数（observe 节点出现次数）
+        # 统计 observe 出现次数作为轮数
         iterations = sum(1 for node, _ in updates if node == "observe")
 
         # 打印 ReAct 过程日志
@@ -3609,18 +3045,27 @@ def main():
         print_state_changes(updates)
 ```
 
-**调用链**
+**参数**
 
-```text
-python -m test2 -> main()
-```
+无显式参数，读 .env 和 stdin。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. 初始化失败时退出。
-2. 运行异常时不退出，继续等待输入。
-3. clear 只删除当前 thread checkpoint，不影响长期记忆。
+CLI 交互主循环。
+
+**数据流举例**
+
+provider -> create_runtime -> input -> stream_updates -> final_answer -> print。
+
+**关键点与边界**
+
+clear 只清当前 thread。
+
+**伪代码调用示例**
+
+```python
+main()
+# 启动 CLI 交互循环
 ```
 
 <a id="module-web"></a>
@@ -3631,188 +3076,116 @@ python -m test2 -> main()
 <a id="func-web-get_runtime"></a>
 #### 4.11.1 get_runtime
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 |
-| --- | --- | --- | --- | --- |
-| 无 | - | - | 从 `.env` 读取 provider | 首次调用会创建 runtime |
-
-**参数详解**
-
-本函数没有参数，但会在首次调用时从 `.env` 读取 `LLM_PROVIDER` 并调用 `create_runtime()`。它使用模块级 `_runtime` 做懒加载，避免 Web 启动时就创建数据库和 LLM。后续请求复用同一个 runtime，保证会话 checkpoint 和长期记忆存储一致。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 运行时 | `AgentRuntime` | 单例 runtime | Web 的共享 Agent 依赖 |
-
-**返回详解**
-
-返回的 `AgentRuntime` 被 `get_agent()` 和 `clear_session()` 使用。它包含编译图、checkpointer 和 memory store，是 Web 后端唯一的运行时实例。
-
-**作用**
-
-```text
-懒加载全局 runtime
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def get_runtime():
     global _runtime
+    # 第一次访问才创建，后续请求复用同一个 runtime
     if _runtime is None:
         provider = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
+        # 创建并缓存 AgentRuntime
         _runtime = create_runtime(provider)
     return _runtime
 ```
 
-**调用链**
+**参数**
 
-```text
-get_agent() / clear_session() -> get_runtime()
-```
+无。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. 首次创建时 provider 无效 -> ValueError。
-2. 数据库不可写 -> 创建失败。
+懒加载单例 runtime。
+
+**数据流举例**
+
+首次 create_runtime -> 缓存 -> 后续复用。
+
+**关键点与边界**
+
+避免 Web 启动即创建数据库。
+
+**伪代码调用示例**
+
+```python
+runtime = get_runtime()
 ```
 
 <a id="func-web-get_agent"></a>
 #### 4.11.2 get_agent
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 |
-| --- | --- | --- | --- | --- |
-| 无 | - | - | 间接使用 `get_runtime()` | runtime 必须已创建 |
-
-**参数详解**
-
-本函数没有参数，只是从全局 runtime 取出 `app`。它把“Web 从哪里拿图”封装成单一入口，避免 `chat.gen()` 知道 runtime 内部结构。返回的 app 会被 `stream_updates()` 调用。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| Agent 图 | LangGraph app | `runtime.app` | 可流式运行的编译图 |
-
-**返回详解**
-
-返回的 app 与 `create_runtime()` 创建的图是同一对象。Web 通过它运行 Agent，但不需要访问 checkpoint 或 memory store。
-
-**作用**
-
-```text
-从 runtime 取出编译后的图
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def get_agent():
+    # 从缓存 runtime 取出编译图
     return get_runtime().app
 ```
 
-**调用链**
+**参数**
 
-```text
-chat.gen() -> get_agent()
-```
+无。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. runtime 未初始化 -> get_runtime() 抛错。
+从 runtime 取编译图。
+
+**数据流举例**
+
+get_runtime().app -> app。
+
+**关键点与边界**
+
+Web 不直接接触 checkpointer/store。
+
+**伪代码调用示例**
+
+```python
+app = get_agent()
 ```
 
 <a id="func-web-sse"></a>
 #### 4.11.3 sse
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `event` | `str` | 必填，无默认 | 调用方指定事件类型 | 必须是 `user`/`node`/`final`/`done`/`error` | `"node"` |
-| `data` | `dict` | 必填，无默认 | 调用方构造的 payload | 必须可被 `json.dumps` 序列化 | `{"content": "..."}` |
-
-**参数详解**
-
-`event` 是 SSE 事件名，前端用它区分消息类型；`data` 是事件数据，会被 JSON 序列化后放在 `data:` 行。本函数只负责格式化成标准 SSE 文本，不负责判断事件是否合法。最终返回的字符串会由 `StreamingResponse` 逐块推送给浏览器。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| SSE 文本 | `str` | `event: ...\ndata: ...\n\n` | 一条可推送的 SSE 消息 |
-
-**返回详解**
-
-返回字符串包含事件名和 JSON data，末尾有空行作为 SSE 块分隔。浏览器端通过 `fetch` + `ReadableStream` 解析这些块。
-
-**作用**
-
-```text
-把事件名和 JSON data 打包成一条 SSE 消息
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def sse(event: str, data: dict) -> str:
     """打包一条 SSE 事件"""
+    # 按 SSE 协议拼接 event 和 data，data 用 JSON 序列化
     return (
         f"event: {event}\n"
         f"data: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
     )
 ```
 
-**调用链**
+**参数**
 
-```text
-chat.gen() / chat 空消息错误分支 -> sse()
-```
+- `event`: 事件名。
+- `data`: dict。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. data 含不可序列化对象 -> json.dumps 抛异常，除非 default=str 可转换。
+将事件序列化为 SSE 文本。
+
+**数据流举例**
+
+event+data -> JSON -> event:/data: 文本。
+
+**关键点与边界**
+
+data 必须可 JSON 序列化。
+
+**伪代码调用示例**
+
+```python
+sse("node", {"content": "你好"})
 ```
 
 <a id="func-web-render_node_payload"></a>
 #### 4.11.4 render_node_payload
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `node` | `str` | 必填，无默认 | `stream_updates()` 的 node_name | 通常为 `think`/`act`/`observe` | `"think"` |
-| `update` | `dict` | 必填，无默认 | `stream_updates()` 的 update | 应包含 `messages`、`thought`、`should_act`、`tool_calls`、`iteration` 等键 | `{"messages": [...], "should_act": True}` |
-
-**参数详解**
-
-`node` 表示当前节点名，`update` 是该节点返回的状态增量。本函数把 LangChain 消息对象转成 `{type, content, tool_calls}` 纯文本结构，避免前端依赖 Python 对象。同时保留 `thought`、`should_act`、`tool_calls`、`iteration`，让前端能渲染卡片和指示灯。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| payload | `dict` | 含 node/messages/thought/should_act/tool_calls/iteration | SSE node 事件的数据 |
-
-**返回详解**
-
-返回 dict 会被 `chat.gen()` 包装成 SSE `node` 事件。前端 `renderNode()` 读取它生成 Think/Act/Observe 卡片；字段缺失时使用空字符串或空列表兜底。
-
-**作用**
-
-```text
-把 LangChain 消息对象转成纯文本结构
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def render_node_payload(node: str, update: dict) -> dict:
@@ -3823,8 +3196,10 @@ def render_node_payload(node: str, update: dict) -> dict:
     - 保留 iteration / should_act / tool_calls 供前端展示
     """
     messages = []
+    # 把 LangChain 消息对象转成前端可读纯文本
     for msg in update.get("messages", []):
         entry = {"type": msg.__class__.__name__, "content": str(msg.content)}
+        # 有工具调用时保留 name/args，供前端展示
         tool_calls = getattr(msg, "tool_calls", None)
         if tool_calls:
             entry["tool_calls"] = [
@@ -3832,6 +3207,7 @@ def render_node_payload(node: str, update: dict) -> dict:
             ]
         messages.append(entry)
 
+    # 输出扁平 payload，包含 node/messages/thought/should_act/tool_calls/iteration
     return {
         "node": node,
         "messages": messages,
@@ -3842,112 +3218,83 @@ def render_node_payload(node: str, update: dict) -> dict:
     }
 ```
 
-**调用链**
+**参数**
 
-```text
-chat.gen() -> render_node_payload(node_name, update)
-```
+- `node`, `update`。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. 消息对象没有 content -> str() 可能失败。
-2. update 不是 dict -> .get() 报错。
+把 LangChain 消息转前端可读 payload。
+
+**数据流举例**
+
+update.messages -> 纯文本 entry -> 扁平 dict。
+
+**关键点与边界**
+
+避免前端依赖 Python 对象。
+
+**伪代码调用示例**
+
+```python
+render_node_payload("think", update)
 ```
 
 <a id="func-web-index"></a>
 #### 4.11.5 index
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 |
-| --- | --- | --- | --- | --- |
-| 无 | - | - | FastAPI 路由注入 | 无 |
-
-**参数详解**
-
-本函数没有显式参数，只读取 `STATIC_DIR/index.html` 并返回 HTMLResponse。它是 Web 首页入口，让浏览器加载前端页面。文件读取使用 UTF-8，保证中文内容正确。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 页面 | `HTMLResponse` | index.html 内容 | 浏览器首页 |
-
-**返回详解**
-
-返回 HTML 页面，浏览器拿到后渲染聊天 UI。如果文件不存在，FastAPI 会返回 500。
-
-**作用**
-
-```text
-返回静态 index.html
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 @app.get("/", response_class=HTMLResponse)
 async def index():
+    # 读取 static/index.html 并返回 HTMLResponse
     with open(os.path.join(STATIC_DIR, "index.html"), encoding="utf-8") as f:
         return HTMLResponse(f.read())
 ```
 
-**调用链**
+**参数**
 
-```text
-浏览器 GET / -> index()
-```
+无。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. index.html 缺失 -> FileNotFoundError。
+返回静态首页。
+
+**数据流举例**
+
+index.html -> HTMLResponse。
+
+**关键点与边界**
+
+文件缺失会 500。
+
+**伪代码调用示例**
+
+```python
+await index()
 ```
 
 <a id="func-web-chat"></a>
 #### 4.11.6 chat
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `request` | `FastAPI Request` | 必填，无默认 | FastAPI 路由注入 | body 应含 `message` 字符串和可选 `session_id` | `{"message": "你好", "session_id": "s1"}` |
-
-**参数详解**
-
-`request` 是 FastAPI 请求对象，本函数从中读取 JSON body：`message` 是用户输入，`session_id` 是会话 ID，缺省为 `"default"`。它负责校验空消息，然后构造 `gen()` 生成器并包装成 `StreamingResponse`。该函数不直接运行 Agent，真正的流式逻辑在 `chat.gen()`。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 响应 | `StreamingResponse` | SSE 流 | 浏览器逐事件读取 |
-
-**返回详解**
-
-返回的是 `text/event-stream` 响应，浏览器通过 `fetch` 读取。空消息时返回只含 `error` 事件的流；正常时返回 `user`、`node`、`final`、`done` 事件。
-
-**作用**
-
-```text
-接收用户消息并返回 SSE 流
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 @app.post("/api/chat")
 async def chat(request: Request):
+    # 从请求体读 message 和 session_id
     body = await request.json()
     user_input = body.get("message", "").strip()
     session_id = str(body.get("session_id") or "default").strip() or "default"
+    # 空消息直接返回 error 事件
     if not user_input:
         return StreamingResponse(
             iter([sse("error", {"message": "消息不能为空"})]),
             media_type="text/event-stream",
         )
 
+    # 定义 SSE 生成器，真正流式运行 Agent
     def gen():
         yield sse("user", {"content": user_input})
         updates = []
@@ -3965,137 +3312,125 @@ async def chat(request: Request):
         except Exception as e:
             yield sse("error", {"message": str(e)})
 
+    # 把生成器包装成 SSE 响应
     return StreamingResponse(gen(), media_type="text/event-stream")
 ```
 
-**调用链**
+**参数**
 
-```text
-前端 send() -> POST /api/chat -> chat()
-```
+- `request`: FastAPI Request，body 含 message/session_id。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. 空消息返回 error 事件。
-2. 内部异常在 gen() 中转为 error 事件。
+正常返回 SSE 流；空消息返回 error 流。
+
+**数据流举例**
+
+body -> gen() -> StreamingResponse。
+
+**关键点与边界**
+
+真正运行 Agent 在 gen() 中。
+
+**伪代码调用示例**
+
+```python
+# POST /api/chat
+# 返回 text/event-stream
 ```
 
 <a id="func-web-chat-gen"></a>
 #### 4.11.7 chat.gen
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `user_input` | `str` | 闭包捕获 | `chat()` 读取请求体 | 已由 chat 校验非空 | `"你好"` |
-| `session_id` | `str` | 闭包捕获 | `chat()` 读取请求体 | 非空字符串 | `"s1"` |
-
-**参数详解**
-
-`gen()` 没有显式参数，但闭包捕获 `chat()` 中的 `user_input` 和 `session_id`。它先发送 `user` 事件，再通过 `stream_updates()` 逐节点生成 `node` 事件，最后发送 `final` 和 `done`。如果运行异常，会发送 `error` 事件。该生成器是 Web SSE 的核心流。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 生成器 | `Generator[str]` | 逐个 yield SSE 文本 | StreamingResponse 的数据源 |
-
-**返回详解**
-
-每次 yield 都是一条完整 SSE 文本。`updates` 列表在流式过程中同步收集，用于最后调用 `final_answer()`。前端收到 `done` 后结束本轮请求。
-
-**作用**
-
-```text
-流式运行 Agent 并发送 user/node/final/done/error 事件
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
-def gen():
-    yield sse("user", {"content": user_input})
-    updates = []
-    try:
-        for node_name, update in stream_updates(
-            get_agent(),
-            user_input,
-            session_id,
-        ):
-            updates.append((node_name, update))
-            yield sse("node", render_node_payload(node_name, update))
+    def gen():
+        # 先回显用户消息
+        yield sse("user", {"content": user_input})
+        updates = []
+        try:
+            # 用共享 runner 流式获取节点更新
+            for node_name, update in stream_updates(
+                get_agent(),
+                user_input,
+                session_id,
+            ):
+                # 边发 SSE 边收集 updates，最后提取 final
+                updates.append((node_name, update))
+                # 每个节点发一条 node 事件
+                yield sse("node", render_node_payload(node_name, update))
 
-        yield sse("final", {"content": final_answer(updates)})
-        yield sse("done", {})
-    except Exception as e:
-        yield sse("error", {"message": str(e)})
+            # 发最终答案
+            yield sse("final", {"content": final_answer(updates)})
+            # 通知前端本轮结束
+            yield sse("done", {})
+        except Exception as e:
+            # 异常时发 error 事件，不中断连接
+            yield sse("error", {"message": str(e)})
 ```
 
-**调用链**
+**参数**
 
-```text
-chat() -> StreamingResponse(gen())
-```
+闭包捕获 user_input/session_id。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. Agent 运行异常 -> 捕获后发送 error 事件。
-2. 客户端断开 -> 生成器可能在 yield 时中断。
+user -> node* -> final -> done；异常 -> error。
+
+**数据流举例**
+
+stream_updates -> render_node_payload -> sse -> yield。
+
+**关键点与边界**
+
+边流式边收集 updates，用于 final_answer。
+
+**伪代码调用示例**
+
+```python
+for text in gen():
+    pass
+# 每次 yield 一条 SSE 文本
 ```
 
 <a id="func-web-clear_session"></a>
 #### 4.11.8 clear_session
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 | 示例 |
-| --- | --- | --- | --- | --- | --- |
-| `request` | `FastAPI Request` | 必填，无默认 | FastAPI 路由注入 | body 可含 `session_id`，缺省 `"default"` | `{"session_id": "s1"}` |
-
-**参数详解**
-
-`request` 提供 session_id，本函数调用 `clear_thread(get_runtime(), session_id)` 删除对应会话 checkpoint。它不删除长期记忆，只清空对话历史。前端“清空”按钮调用它。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| JSON | `dict` | `{"ok": True}` | 清空成功 |
-
-**返回详解**
-
-返回固定 JSON，前端只检查请求是否成功，不读取其他字段。清空后同一 session_id 会从新会话开始。
-
-**作用**
-
-```text
-清空指定 session 的对话 checkpoint
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 @app.post("/api/clear")
 async def clear_session(request: Request):
     body = await request.json()
     session_id = str(body.get("session_id") or "default").strip() or "default"
+    # 复用共享清空逻辑，只删除当前会话 checkpoint
     clear_thread(get_runtime(), session_id)
+    # 返回固定成功 JSON
     return {"ok": True}
 ```
 
-**调用链**
+**参数**
 
-```text
-前端 clearSession() -> POST /api/clear -> clear_session()
-```
+- `request`: body 含 session_id。
 
-**失败模式**
+**整体执行场景**
 
-```text
-1. runtime 未初始化 -> get_runtime() 抛错。
-2. delete_thread 失败 -> FastAPI 返回 500。
+删除当前会话 checkpoint。
+
+**数据流举例**
+
+session_id -> clear_thread -> {"ok": True}。
+
+**关键点与边界**
+
+不清长期记忆。
+
+**伪代码调用示例**
+
+```python
+# POST /api/clear
+# 返回 {"ok": True}
 ```
 
 <a id="module-init"></a>
@@ -4104,49 +3439,35 @@ async def clear_session(request: Request):
 <a id="func-init-hello"></a>
 #### 4.12.1 hello
 
-**快速参数表**
-
-| 参数 | 类型 | 必填/默认 | 来源 | 约束/非法值 |
-| --- | --- | --- | --- | --- |
-| 无 | - | - | - | - |
-
-**参数详解**
-
-本函数没有参数，只打印一行示例文本，用于验证 package 可导入或可直接运行。它不参与 Agent 业务链路，也不是 CLI/Web 的调用路径。
-
-**快速返回表**
-
-| 返回 | 类型 | 可能值 | 含义 |
-| --- | --- | --- | --- |
-| 无 | `None` | 始终 `None` | 打印输出 |
-
-**返回详解**
-
-没有返回值；效果是在终端打印 `Hello from py112!`。它不代表项目功能，只是 package 示例。
-
-**作用**
-
-```text
-验证 package 可导入的示例函数
-```
-
-**源码**
+**逐行注释源码**
 
 ```python
 def hello() -> None:
+    # 仅验证包可运行的示例函数
     print("Hello from py112!")
 ```
 
-**调用链**
+**参数**
 
-```text
-仅当直接运行 `python src/test2/__init__.py` 时触发
-```
+无。
 
-**失败模式**
+**整体执行场景**
 
-```text
-无输入，因此没有用户输入相关失败；它也不参与 Agent 业务流程。
+打印示例文本。
+
+**数据流举例**
+
+print("Hello from py112!")。
+
+**关键点与边界**
+
+不参与 Agent 流程。
+
+**伪代码调用示例**
+
+```python
+hello()
+# 输出 Hello from py112!
 ```
 
 <a id="module-frontend"></a>

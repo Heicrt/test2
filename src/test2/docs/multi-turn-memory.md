@@ -631,14 +631,10 @@ def get_facts(self, scope, category):
     row = self.conn.execute(...).fetchone()
     if not row:
         return []
-    try:
-        data = json.loads(row["facts_json"])
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(data, list):
-        return []
-    return [str(item) for item in data]
+    return _decode_facts_json(row["facts_json"])
 ```
+
+`_decode_facts_json` 是模块级私有解析函数，`get_facts` 和 `get_memory_context` 共用，统一处理损坏 JSON、非 list 数据和字符串转换。
 
 ### 5.5 `get_memory_context(scope=MEMORY_SCOPE)`
 
@@ -664,11 +660,13 @@ str：可注入 LLM 的长期记忆文本
 
 ```python
 def get_memory_context(self, scope=MEMORY_SCOPE):
-    rows = self.conn.execute(...).fetchall()
+    rows = self.conn.execute(
+        "SELECT category, facts_json ... ORDER BY category"
+    ).fetchall()
     parts = []
     for row in rows:
         category = row["category"]
-        facts = self.get_facts(scope, category)
+        facts = _decode_facts_json(row["facts_json"])
         if facts:
             parts.append(f"{category}:\n- " + "\n- ".join(facts))
     return "\n\n".join(parts)
