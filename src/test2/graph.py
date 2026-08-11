@@ -3,7 +3,7 @@
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.graph import StateGraph, END
 
-from test2.config import get_llm
+from test2.config import get_llm, get_memory_extraction_llm
 from test2.memory import (
     compose_llm_input,
     extract_memory_facts,
@@ -152,6 +152,7 @@ def build_graph(
     """
     llm = get_llm(provider)
     llm_with_tools = llm.bind_tools(TOOLS)
+    extract_llm = get_memory_extraction_llm(provider)
 
     graph = StateGraph(ReActState)
     graph.add_node(
@@ -162,7 +163,7 @@ def build_graph(
     graph.add_node("observe", observe_node)
     graph.add_node(
         "extract",
-        lambda state: extract_memory_facts(state, llm, memory_store),
+        lambda state: extract_memory_facts(state, extract_llm, memory_store),
     )
 
     graph.set_entry_point("think")

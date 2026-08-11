@@ -856,7 +856,7 @@ def think_node(state, llm_with_tools, llm, memory_store):
 
 ```text
 state：ReActState
-llm：原始 LLM
+llm：长期记忆提取专用 LLM（DeepSeek 会关闭 thinking mode）
 memory_store：MemoryStore（LongTermMemoryStore 是实现）
 ```
 
@@ -876,28 +876,37 @@ dict：通常是空 dict
 
 ```python
 def extract_memory_facts(state, llm, memory_store):
-    try:
-        config = get_config()
-        thread_id = config.get("configurable", {}).get("thread_id")
+    thread_id = get_config()["configurable"]["thread_id"]
+    prompt = [SystemMessage(content=EXTRACT_PROMPT)]
+    if state.get("summary"):
+        prompt.append(SystemMessage(content=f"会话摘要：\n{state['summary']}"))
+    prompt.extend(state["messages"])
 
-        prompt = [SystemMessage(content=EXTRACT_PROMPT)]
-        if state.get("summary"):
-            prompt.append(SystemMessage(content=f"会话摘要：\n{state['summary']}"))
-        prompt.extend(state["messages"])
+    # 优先强制 Function Calling，返回 save_long_term_memory 参数
+    data = _try_function_calling(llm, prompt)
+    # 没有工具调用时，追加“必须调用工具”的纠正消息再试一次
+    if data is None:
+        corrected_prompt = [
+            *prompt,
+            SystemMessage(content="你必须调用 save_long_term_memory，不要输出普通文本。"),
+        ]
+        data = _try_function_calling(llm, corrected_prompt)
+    # Function Calling 不可用时回退 JSON mode
+    if data is None:
+        data = _try_json_mode(llm, prompt)
+    # 最后回退普通 LLM 调用
+    if data is None:
+        data = _try_raw_invoke(llm, prompt)
 
-        response = llm.invoke(prompt)
-        data = parse_memory_json(response.content)
-        for category in CATEGORIES:
-            facts = data.get(category)
-            if isinstance(facts, list):
-                memory_store.merge_facts(
-                    MEMORY_SCOPE,
-                    category,
-                    facts,
-                    source_thread_id=thread_id,
-                )
-    except Exception as e:
-        print(f"[memory] 长期记忆提取失败: {e}")
+    for category in CATEGORIES:
+        facts = data.get(category)
+        if isinstance(facts, list):
+            memory_store.merge_facts(
+                MEMORY_SCOPE,
+                category,
+                facts,
+                source_thread_id=thread_id,
+            )
     return {}
 ```
 
@@ -905,14 +914,14 @@ def extract_memory_facts(state, llm, memory_store):
 
 ```text
 1. 获取 thread_id
-2. 构造提取 prompt
-3. 放入 summary
-4. 放入 messages
-5. 调用原始 llm
-6. 解析 JSON
+2. 构造包含 Schema 和正例的提取 prompt
+3. 优先 Function Calling，用 Pydantic 强类型校验
+4. 失败后追加纠正消息自纠错一次
+5. 回退 JSON mode
+6. 回退普通 LLM 调用
 7. 按 category 写入 Store
-8. 失败只打印日志
-9. 不中断对话
+8. 全部失败只打印日志
+9. 保留旧记忆，不中断对话
 ```
 
 ### 6.5 `act_node(state)`
@@ -1046,12 +1055,13 @@ memory_store：MemoryStore（LongTermMemoryStore 是实现）
 def build_graph(provider, *, checkpointer, memory_store):
     llm = get_llm(provider)
     llm_with_tools = llm.bind_tools(TOOLS)
+    extract_llm = get_memory_extraction_llm(provider)
 
     graph = StateGraph(ReActState)
     graph.add_node("think", lambda state: think_node(state, llm_with_tools, llm, memory_store))
     graph.add_node("act", act_node)
     graph.add_node("observe", observe_node)
-    graph.add_node("extract", lambda state: extract_memory_facts(state, llm, memory_store))
+    graph.add_node("extract", lambda state: extract_memory_facts(state, extract_llm, memory_store))
 
     graph.add_conditional_edges(
         "think",
@@ -1372,7 +1382,9 @@ token > 6000
 ```text
 think 无工具
   → extract_node
-  → LLM JSON
+  → 长期记忆提取 LLM（DeepSeek 关闭 thinking）
+  → Function Calling → Pydantic 校验
+  → 失败自纠错 / JSON mode / 普通调用
   → LongTermMemoryStore
   → END
 ```
@@ -1413,8 +1425,10 @@ RemoveMessage 无法删除
 ### 11.4 长期记忆提取失败
 
 ```text
-extract_node 捕获异常
-不中断对话
+Function Calling、JSON mode、普通调用全部失败
+→ 打印失败日志
+→ 保留旧记忆
+→ 不中断对话
 ```
 
 ### 11.5 SQLite 文件

@@ -38,7 +38,11 @@ with open(PRESETS_PATH, "rb") as f:
     '''
 
 
-def get_llm(provider: str | None = None, temperature: float | None = None):
+def get_llm(
+    provider: str | None = None,
+    temperature: float | None = None,
+    extra_body: dict | None = None,
+):
     """
     将供应商名称和可选温度参数解析为 LangChain ChatModel 实例。
     内部自动从环境变量补齐 provider、model、api_key 和 temperature 等配置，
@@ -50,6 +54,8 @@ def get_llm(provider: str | None = None, temperature: float | None = None):
             可为 None 或空字符串，此时自动读取环境变量并统一转为小写。
         temperature: 模型采样温度；不传时读取 .env 的 LLM_TEMPERATURE，
             缺省值为 0。
+        extra_body: OpenAI 协议额外请求体；当前用于 DeepSeek 关闭 thinking mode，
+            Anthropic 协议会忽略该参数。
 
     Returns:
         LangChain ChatModel: 可执行 invoke 和 bind_tools 的模型实例。
@@ -107,6 +113,30 @@ def get_llm(provider: str | None = None, temperature: float | None = None):
             api_key=api_key or "placeholder",
             base_url=base_url,
             temperature=temperature,
+            extra_body=extra_body,
         )
 
     raise ValueError(f"不支持的协议: {protocol}")
+
+
+def get_memory_extraction_llm(provider: str | None = None):
+    """
+    将供应商名称解析为长期记忆提取专用的 LLM 实例。
+    DeepSeek V4 默认开启 thinking mode，会拒绝强制 tool_choice；
+    因此 DeepSeek 使用 extra_body 关闭 thinking，其他供应商保持 get_llm 原行为。
+
+    Args:
+        provider: 供应商名称，通常来自 .env 的 LLM_PROVIDER；
+            可为 None 或空字符串，此时自动读取环境变量。
+
+    Returns:
+        LangChain ChatModel: 可用于长期记忆 Function Calling 提取的模型实例。
+
+    Raises:
+        ValueError: provider 为空、provider 不在 providers.toml、
+            protocol 不支持，或 LLM_TEMPERATURE 不是合法数字时触发。
+    """
+    provider = (provider or os.getenv("LLM_PROVIDER", "")).strip().lower()
+    if provider == "deepseek":
+        return get_llm(provider, extra_body={"thinking": {"type": "disabled"}})
+    return get_llm(provider)

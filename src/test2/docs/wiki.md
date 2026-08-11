@@ -1206,6 +1206,8 @@ def build_graph(
     llm = get_llm(provider)
     # 再绑定工具，得到 think 节点使用的模型
     llm_with_tools = llm.bind_tools(TOOLS)
+    # 长期记忆提取单独创建模型；DeepSeek 会关闭 thinking mode
+    extract_llm = get_memory_extraction_llm(provider)
 
     # 用 ReActState 定义图的状态契约
     graph = StateGraph(ReActState)
@@ -1221,7 +1223,7 @@ def build_graph(
     # 注册 think 节点，并通过 lambda 闭包注入 llm/memory_store
     graph.add_node(
         "extract",
-        lambda state: extract_memory_facts(state, llm, memory_store),
+        lambda state: extract_memory_facts(state, extract_llm, memory_store),
     )
 
     graph.set_entry_point("think")
@@ -1473,57 +1475,61 @@ parse_memory_json('{"user_preferences": []}')
 ```python
 def extract_memory_facts(state, llm, memory_store: MemoryStore) -> dict:
     """最终回复后提取项目级长期记忆；失败时保留旧记忆，不中断对话。"""
-    try:
-        config = get_config()
-        # 从 LangGraph config 拿 thread_id，作为长期记忆来源会话
-        thread_id = config.get("configurable", {}).get("thread_id")
+    thread_id = get_config()["configurable"]["thread_id"]
+    prompt = [SystemMessage(content=EXTRACT_PROMPT)]
+    if state.get("summary"):
+        prompt.append(SystemMessage(content=f"会话摘要：\n{state['summary']}"))
+    prompt.extend(state["messages"])
 
-        # 第一条是提取指令，告诉 LLM 只输出固定 JSON
-        prompt = [SystemMessage(content=EXTRACT_PROMPT)]
-        # 有会话摘要时把摘要也放进去，提取结果更完整
-        if state.get("summary"):
-            prompt.append(
-                SystemMessage(content=f"会话摘要：\n{state['summary']}")
+    # 优先强制 Function Calling，返回 save_long_term_memory 参数
+    data = _try_function_calling(llm, prompt)
+    # 没有工具调用时，追加“必须调用工具”的纠正消息再试一次
+    if data is None:
+        corrected_prompt = [
+            *prompt,
+            SystemMessage(content="你必须调用 save_long_term_memory，不要输出普通文本。"),
+        ]
+        data = _try_function_calling(llm, corrected_prompt)
+    # Function Calling 不可用时回退 JSON mode
+    if data is None:
+        data = _try_json_mode(llm, prompt)
+    # 最后回退普通 LLM 调用
+    if data is None:
+        data = _try_raw_invoke(llm, prompt)
+
+    for category in CATEGORIES:
+        facts = data.get(category)
+        if isinstance(facts, list):
+            memory_store.merge_facts(
+                MEMORY_SCOPE,
+                category,
+                facts,
+                source_thread_id=thread_id,
             )
-        # 把对话消息追加到 prompt，让 LLM 基于真实对话提取
-        prompt.extend(state["messages"])
-
-        # 调用原始 LLM 生成记忆 JSON
-        response = llm.invoke(prompt)
-        data = parse_memory_json(response.content)
-        # 遍历五个固定类别，逐类写入 store
-        for category in CATEGORIES:
-            facts = data.get(category)
-            if isinstance(facts, list):
-                # 只写入当前提取到的事实，不覆盖旧记忆
-                memory_store.merge_facts(
-                    MEMORY_SCOPE,
-                    category,
-                    facts,
-                    source_thread_id=thread_id,
-                )
-    except Exception as e:
-        print(f"[memory] 长期记忆提取失败: {e}")
     return {}
 ```
 
 **参数**
 
 - `state`: 当前状态。
-- `llm`: 原始模型。
+- `llm`: 长期记忆提取专用模型；DeepSeek 会关闭 thinking mode。
 - `memory_store`: MemoryStore。
 
 **整体执行场景**
 
-正常：提取并写入记忆；异常：LLM/JSON/store 失败只打印日志。
+正常：Function Calling 返回结构化参数，Pydantic 校验后写入记忆；
+异常：自纠错失败后回退 JSON mode，再失败回退普通调用，全部失败只打印日志。
 
 **数据流举例**
 
-state+summary+messages -> LLM JSON -> 按类别 merge_facts。
+state+summary+messages
+-> Function Calling / JSON mode / 普通调用
+-> MemoryExtraction 强类型校验
+-> 按类别 merge_facts。
 
 **关键点与边界**
 
-不覆盖旧记忆，失败不中断对话。
+不覆盖旧记忆；DeepSeek 提取专用 LLM 关闭 thinking mode，避免强制 Function Calling 被拒绝。
 
 **伪代码调用示例**
 
@@ -3771,12 +3777,15 @@ flowchart LR
 ```mermaid
 flowchart LR
     A[think_node 判定无需工具] --> B[extract_node]
-    B --> C[原始 LLM 提取 JSON]
-    C --> D{JSON 合法?}
+    B --> C[Function Calling 提取]
+    C --> D{Pydantic 校验通过?}
     D -->|是| E[LongTermMemoryStore.merge_facts]
-    D -->|否| F[打印日志，保留旧记忆]
-    E --> G[END]
-    F --> G
+    D -->|否| F[自纠错一次]
+    F --> G[JSON mode / 普通调用兜底]
+    G -->|成功| E
+    G -->|失败| H[打印日志，保留旧记忆]
+    E --> I[END]
+    H --> I
 ```
 
 记忆类别：
