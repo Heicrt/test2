@@ -67,12 +67,12 @@
 ```
 浏览器                          web.py                        graph.py
   │  输入"北京天气怎么样？"          │                               │
-  │ ────────── POST /api/chat ────▶ │ ── agent.stream(updates) ──▶ │
+  │ ────────── POST /api/chat ────▶ │ ── stream_agent_events() ──▶ │
   │                                │ ◀── step1(think) ─────────── │
   │ ◀── event: node (think) ────── │                               │
   │ ◀── event: node (act)   ────── │ ◀── step2(act) ───────────── │
   │ ◀── event: node (observe) ──── │ ◀── step3(observe) ───────── │
-  │ ◀── event: final ───────────── │                               │
+  │ ◀── event: token ────────────── │                               │
   │ ◀── event: done ────────────── │                               │
 ```
 
@@ -84,13 +84,13 @@
 |---|---|---|
 | 启动方式 | `python -m test2` | `uvicorn test2.web:app` |
 | 交互 | 终端 `input()` | 浏览器输入框 |
-| 驱动 Agent | `app.stream(...)` | `get_agent().stream(...)`（同一方法） |
-| 获取每一步 | `stream_mode="updates"` | `stream_mode="updates"`（同一参数） |
+| 驱动 Agent | `app.stream(...)` | `agent_session.stream_agent_events()` |
+| 获取流 | `stream_mode="updates"` | `stream_mode=["updates", "messages"]` |
 | 处理每步 | `print_state_changes()` 打印 | `render_node_payload()` 转 JSON 推送 |
-| 最终回复 | `all_messages[-1]` 打印 | 反向扫描取最后一条 AI 消息推送 |
+| 最终回复 | `all_messages[-1]` 打印 | `token` 事件逐字推送 |
 | 输出对象 | 终端文本 | 浏览器卡片 |
 
-`web.py` **复用了 `__main__.py` 里 `stream(stream_mode="updates")` 的产物**，只是把"打印到终端"换成了"打包成 SSE 推送到浏览器"。所以如果你已经看懂 wiki.md 的 CLI 部分，Web 篇只需要理解一个新增概念：**如何把 LangGraph 吐出来的 Python 对象，变成浏览器能实时渲染的文本流**。
+`web.py` **复用了 `agent_session.stream_agent_events()`**，同时消费 LangGraph 的节点更新和 LLM token，再分别打包成 SSE 推送给浏览器。CLI 只需要最终打印，Web 还需要逐字显示 AI 回复。
 
 ### 1.3 技术栈
 
@@ -135,7 +135,7 @@ test2/
 
 - **FastAPI 决定"怎么接"**：`/` 返回页面，`/api/chat` 接收消息。
 - **SSE 决定"怎么传"**：把 Agent 的每一步包成 `event: xxx` + `data: {...}` 的文本块，用一条不断开的 HTTP 连接推过去。
-- **前端决定"怎么显示"**：解析事件流，把 `node` 事件画成 think/act/observe 三色卡片，把 `final` 事件画成最终回答气泡。
+- **前端决定"怎么显示"**：解析事件流，把 `node` 事件画成 think/act/observe 三色卡片，把 `token` 事件逐字追加到最终回答气泡。
 
 ### 2.2 一条消息的完整旅程（先看全局）
 
@@ -361,14 +361,14 @@ data: {"node":"think","iteration":0,"thought":"我需要查询天气..."}
 |---|---|---|
 | `user` | 请求开始 | 渲染用户气泡 |
 | `node` | 每跑完一个节点 | 渲染 think/act/observe 卡片 + 更新指示器 |
-| `final` | 所有节点跑完 | 渲染最终回答气泡 |
+| `token` | LLM 输出过程中 | 逐字追加最终回答气泡 |
 | `done` | 流程结束 | 收尾（可省略，表示正常结束） |
 | `error` | 抛异常 / 空消息 | 渲染错误气泡 |
 
 **为什么要细分事件类型？** 因为前端**需要区分"这段数据是什么"**才能决定怎么渲染：
 
 - `node` 数据是节点状态（要画卡片、动指示器）；
-- `final` 数据是最终文本（要画气泡）；
+- `token` 数据是最终文本片段（要追加到气泡）；
 - `error` 是异常（要红字提示）。
 
 如果把所有数据都塞进一个 `message` 事件，前端就得靠猜数据结构来分辨，脆弱且混乱。**用 `event:` 字段显式标注类型**，前端 `switch` 一下就能干净地分发。
@@ -397,71 +397,36 @@ return StreamingResponse(gen(), media_type="text/event-stream")
 ```python
 def gen():
     yield sse("user", {"content": user_input})          # ① 先推用户消息
-    all_messages = []                                    # ② 收集所有消息，供最终回复用
     try:
-        steps = get_agent().stream(                      # ③ 驱动 ReAct 图
-            {
-                "messages": [HumanMessage(content=user_input)],
-                "thought": "",
-                "should_act": False,
-                "tool_calls": [],
-                "iteration": 0,
-            },
-            config={"recursion_limit": MAX_ITERATIONS * 3},
-            stream_mode="updates",
-        )
-        for step in steps:                               # ④ 遍历每一步
-            for node_name, update in step.items():       # ⑤ 拆出节点名和更新
-                payload = render_node_payload(node_name, update)   # ⑥ 转扁平 JSON
-                all_messages.extend(payload["messages"]) # ⑦ 收集消息
-                yield sse("node", payload)               # ⑧ 推送 node 事件
-        # 最终回复：取最后一条非工具调用、有内容的 AI 消息
-        final_content = "（无最终回复）"
-        for m in reversed(all_messages):                 # ⑨ 反向扫描
-            if m["type"] == "AIMessage" and m["content"].strip():
-                if not m.get("tool_calls"):
-                    final_content = m["content"]
-                    break
-        yield sse("final", {"content": final_content})   # ⑩ 推 final
-        yield sse("done", {})                            # ⑪ 推 done
+        for event in stream_agent_events(                # ② 驱动共享事件流
+            get_agent(),
+            user_input,
+            session_id,
+        ):
+            if event[0] == "node":                       # ③ node 事件
+                _, node_name, update = event
+                yield sse("node", render_node_payload(node_name, update))
+            elif event[0] == "token":                    # ④ token 事件
+                _, content = event
+                yield sse("token", {"content": content})
+        yield sse("done", {})                            # ⑤ 推 done
     except Exception as e:
-        yield sse("error", {"message": str(e)})          # ⑫ 异常 → error
+        yield sse("error", {"message": str(e)})          # ⑥ 异常 → error
 ```
 
 逐行拆解：
 
 **① `yield sse("user", ...)`**：先把用户输入推给前端渲染用户气泡。这一步不依赖 Agent，纯回显。
 
-**② `all_messages = []`**：一个"旁路收集器"。因为最终回复要从所有消息里挑，所以每步产生的消息都要存一份副本（这里存的是扁平化后的 dict，不是 LangChain 对象）。
+**② `stream_agent_events(...)`**：共享 runner 同时请求 `updates` 和 `messages` 两种流。`updates` 产出节点状态，`messages` 产出 LLM token。
 
-**③ `get_agent().stream(...)`**：驱动图和 `__main__.py` 里完全一样的调用方式：
-- 初始 state 里塞入 `HumanMessage`（用户输入）和各字段初始值。
-- `stream_mode="updates"`：**只返回每个节点被"更新"的那部分 state**，而不是全量 state。这样每一步很轻量，方便推送。
-- `config={"recursion_limit": MAX_ITERATIONS * 3}`：LangGraph 的递归上限，防无限循环（`MAX_ITERATIONS` 在 graph.py 里是 35，所以上限 105）。
+**③ `node` 事件**：`render_node_payload()` 把 LangChain 对象转成前端友好的 JSON，前端立即渲染一张 ReAct 卡片。
 
-**④ `for step in steps:`**：`steps` 是一个可迭代对象（生成器），每 `next` 一次就产生一个 `step`——即**一个节点跑完后的更新**。
+**④ `token` 事件**：LLM 每输出一段文本就立即推送，前端把内容追加到同一个 assistant 气泡，形成逐字显示效果。
 
-**⑤ `for node_name, update in step.items():`**：每个 `step` 是 `{节点名: 更新}` 的字典。`node_name` 是 `think`/`act`/`observe`，`update` 是该节点返回的 state 增量。
+**⑤ `done`**：流程正常结束后推一个空事件。
 
-**⑥ `render_node_payload(...)`**：把 LangChain 对象转成前端友好的 JSON（第五章细讲）。
-
-**⑦ `all_messages.extend(...)`**：把这一步产生的消息并入收集器，供最终回复扫描。
-
-**⑧ `yield sse("node", payload)`**：**推送！** 每跑完一个节点，立刻把该节点状态推给浏览器，前端立即渲染一张卡片。
-
-**⑨ 反向扫描找最终回复**：
-```python
-for m in reversed(all_messages):
-    if m["type"] == "AIMessage" and m["content"].strip():
-        if not m.get("tool_calls"):
-            final_content = m["content"]
-            break
-```
-从最后一条往前找：要求是 `AIMessage`（AI 的文本回复）、内容非空、**且没有 tool_calls**（不是"请求调用工具"那种中间思考，而是真正的最终回答）。找到就跳出。找不到则用默认 `（无最终回复）`。
-
-**⑩⑪ `final` + `done`**：推最终回答，再推一个空 `done` 表示流程正常结束。
-
-**⑫ `except` → `error`**：整个 Agent 运行包裹在 try 里，任何异常（如 API Key 无效）都被捕获并转成 `error` 事件推给前端。**关键：不会让连接崩溃，而是优雅地告知前端**。
+**⑥ `except` → `error`**：整个 Agent 运行包裹在 try 里，任何异常（如 API Key 无效）都被捕获并转成 `error` 事件推给前端。**关键：不会让连接崩溃，而是优雅地告知前端**。
 
 ### 4.6 异常处理 → `error` 事件
 
@@ -470,7 +435,7 @@ except Exception as e:
     yield sse("error", {"message": str(e)})
 ```
 
-设计意图：**把异常也变成"一种正常的事件流"**。前端无论收到 `node`/`final`/`error`，走的是同一条连接、同一种解析逻辑。这让前端代码更统一——只要监听事件类型即可，不用额外处理"连接中途断开"的情况（当然，非 SSE 层的异常仍会断连，那归 8.3 的"连接错误"处理）。
+设计意图：**把异常也变成"一种正常的事件流"**。前端无论收到 `node`/`token`/`error`，走的是同一条连接、同一种解析逻辑。这让前端代码更统一——只要监听事件类型即可，不用额外处理"连接中途断开"的情况（当然，非 SSE 层的异常仍会断连，那归 8.3 的"连接错误"处理）。
 
 ---
 
@@ -654,9 +619,15 @@ function handleEvent(event, data, spans, getActiveIdx) {
       spans[idx].classList.add("active");
     }
     renderNode(data);
-  } else if (event === "final") {
-    bubble(data.content, "assistant");
-    statusEl.textContent = "完成";
+  } else if (event === "token") {
+    if (!assistantEl) {
+      assistantEl = document.createElement("div");
+      assistantEl.className = "bubble assistant";
+      append(assistantEl);
+    }
+    assistantEl.textContent += data.content;
+  } else if (event === "done") {
+    statusEl.textContent = "就绪";
   } else if (event === "error") {
     bubble("❌ " + data.message, "assistant");
   }
@@ -666,10 +637,10 @@ function handleEvent(event, data, spans, getActiveIdx) {
 逐段看：
 
 - **`event === "node"`**：收到节点事件，先更新顶部状态指示器（6.6 详讲），再调 `renderNode(data)` 渲染卡片。
-- **`event === "final"`**：收到最终回答，用 `bubble(data.content, "assistant")` 渲染 AI 气泡，状态栏改为"完成"。
+- **`event === "token"`**：收到最终回答片段，追加到同一个 assistant 气泡；首次收到时创建气泡。
 - **`event === "error"`**：收到错误，渲染红色错误气泡。
 
-这个 `if/else` 就是**事件分发的核心**——根据 `event:` 字段（4.2 打包的那个）决定走哪个渲染分支。注意 `done` 事件在这里没有分支（可以忽略，因为 `final` 已标记完成）。
+这个 `if/else` 就是**事件分发的核心**——根据 `event:` 字段（4.2 打包的那个）决定走哪个渲染分支。`done` 事件用于把状态栏复位为“就绪”。
 
 ### 6.5 三色节点卡片渲染
 
@@ -790,8 +761,8 @@ sequenceDiagram
     W-->>B: event: node {node:think}
     B-->>B: 渲染 think 卡片
 
-    W-->>B: event: final {content}
-    B-->>B: 渲染 AI 气泡 + 状态"完成"
+    W-->>B: event: token {content}
+    B-->>B: 逐字追加 AI 气泡
     W-->>B: event: done {}
 ```
 
@@ -815,8 +786,11 @@ data: {"node":"observe","messages":[{"type":"ToolMessage","content":"北京：�
 event: node
 data: {"node":"think","thought":"已拿到天气结果，直接回答用户","tool_calls":[],"should_act":false,"iteration":1}
 
-event: final
-data: {"content":"北京今天晴，气温 25°C。"}
+event: token
+data: {"content":"北京"}
+
+event: token
+data: {"content":"今天晴，气温 25°C。"}
 
 event: done
 data: {}

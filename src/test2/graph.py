@@ -37,7 +37,10 @@ def think_node(state: ReActState, llm_with_tools, llm, memory_store) -> dict:
     )
     llm_input = compose_llm_input(memory_store, summary, recent_history)
 
-    response = llm_with_tools.invoke(llm_input)
+    response = llm_with_tools.invoke(
+        llm_input,
+        config={"tags": [FINAL_ANSWER_TAG]},
+    )
 
     # 判断 AI 是否请求了工具调用
     has_tool_calls = bool(response.tool_calls)
@@ -122,6 +125,7 @@ def should_continue(state: ReActState) -> str:
 
 MAX_ITERATIONS = 35
 MEMORY_WINDOW = 20
+FINAL_ANSWER_TAG = "final-answer"
 
 
 def build_graph(

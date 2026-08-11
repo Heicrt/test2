@@ -356,7 +356,7 @@ SqliteSaver (checkpointer)
 
 - `agent_session.py` 统一构造初始 state、config、stream、消息收集、最终答案和清空。
 - `__main__.py` 是 CLI 交互入口。
-- `web.py` 是 FastAPI + SSE 入口，复用 `agent_session.stream_updates()`。
+- `web.py` 是 FastAPI + SSE 入口，复用 `agent_session.stream_agent_events()`。
 
 <a id="architecture-frontend"></a>
 ### 2.9 前端层：static/index.html
@@ -374,7 +374,7 @@ SqliteSaver (checkpointer)
 
 ```text
 CLI/Web
-  -> agent_session.stream_updates()
+  -> agent_session.stream_agent_events()
   -> runtime.app (LangGraph)
   -> think_node
       -> prepare_conversation()
@@ -3300,17 +3300,19 @@ async def chat(request: Request):
     # 定义 SSE 生成器，真正流式运行 Agent
     def gen():
         yield sse("user", {"content": user_input})
-        updates = []
         try:
-            for node_name, update in stream_updates(
+            for event in stream_agent_events(
                 get_agent(),
                 user_input,
                 session_id,
             ):
-                updates.append((node_name, update))
-                yield sse("node", render_node_payload(node_name, update))
-
-            yield sse("final", {"content": final_answer(updates)})
+                kind = event[0]
+                if kind == "node":
+                    _, node_name, update = event
+                    yield sse("node", render_node_payload(node_name, update))
+                elif kind == "token":
+                    _, content = event
+                    yield sse("token", {"content": content})
             yield sse("done", {})
         except Exception as e:
             yield sse("error", {"message": str(e)})
@@ -3351,21 +3353,21 @@ body -> gen() -> StreamingResponse。
     def gen():
         # 先回显用户消息
         yield sse("user", {"content": user_input})
-        updates = []
         try:
-            # 用共享 runner 流式获取节点更新
-            for node_name, update in stream_updates(
+            # 用共享 runner 同时获取节点更新和 token
+            for event in stream_agent_events(
                 get_agent(),
                 user_input,
                 session_id,
             ):
-                # 边发 SSE 边收集 updates，最后提取 final
-                updates.append((node_name, update))
-                # 每个节点发一条 node 事件
-                yield sse("node", render_node_payload(node_name, update))
-
-            # 发最终答案
-            yield sse("final", {"content": final_answer(updates)})
+                # node 事件用于 ReAct 卡片
+                if event[0] == "node":
+                    _, node_name, update = event
+                    yield sse("node", render_node_payload(node_name, update))
+                # token 事件用于最终回复逐字展示
+                elif event[0] == "token":
+                    _, content = event
+                    yield sse("token", {"content": content})
             # 通知前端本轮结束
             yield sse("done", {})
         except Exception as e:
@@ -3379,15 +3381,15 @@ body -> gen() -> StreamingResponse。
 
 **整体执行场景**
 
-user -> node* -> final -> done；异常 -> error。
+user -> node* -> token* -> done；异常 -> error。
 
 **数据流举例**
 
-stream_updates -> render_node_payload -> sse -> yield。
+stream_agent_events -> node/token -> sse -> yield。
 
 **关键点与边界**
 
-边流式边收集 updates，用于 final_answer。
+node 事件渲染卡片，token 事件逐字追加最终回复。
 
 **伪代码调用示例**
 
@@ -3678,7 +3680,7 @@ getActiveIdx：读取当前激活指示灯的 function
 **作用**
 
 ```text
-分发 node / final / error 事件
+分发 node / token / done / error 事件
 ```
 
 <a id="sec-data-flow"></a>
@@ -3721,14 +3723,13 @@ sequenceDiagram
     participant G as LangGraph
 
     B->>F: POST /api/chat
-    F->>A: stream_updates(get_agent(), user_input, session_id)
+    F->>A: stream_agent_events(get_agent(), user_input, session_id)
     A->>G: app.stream(...)
-    loop 每个节点
-        G-->>A: (node_name, update)
-        A-->>F: 扁平 update
-        F-->>B: SSE node 事件
+    loop updates + messages
+        G-->>A: node update / token
+        A-->>F: node / token
+        F-->>B: SSE node / token 事件
     end
-    F-->>B: SSE final 事件
     F-->>B: SSE done 事件
 ```
 
@@ -3737,7 +3738,7 @@ sequenceDiagram
 ```text
 user : 回显用户消息
 node : 节点状态
-final: 最终答案
+token: 最终回复逐字内容
 done : 本轮结束
 error: 错误信息
 ```
@@ -3853,7 +3854,7 @@ uv run pytest
 当前测试覆盖：
 
 ```text
-agent_session.initial_state / session_config / stream_updates / clear_thread
+agent_session.initial_state / session_config / stream_updates / stream_agent_events / clear_thread
 agent_session.collect_messages / final_answer
 memory section 空/非空
 compose_llm_input 顺序

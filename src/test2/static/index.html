@@ -169,6 +169,7 @@
     const statusEl = document.getElementById("status");
 
     let running = false;
+    let assistantEl = null;
 
     function getSessionId() {
       let id = localStorage.getItem("test2_session_id");
@@ -206,7 +207,7 @@
     }
 
     // 根据 node 事件渲染卡片
-    function renderNode(data) {
+    function renderNode(data, beforeEl) {
       const label = { think: "🤔 Think", act: "⚡ Act", observe: "👁️ Observe" }[data.node] || data.node;
       const div = document.createElement("div");
       div.className = "card " + (data.node || "think");
@@ -242,7 +243,12 @@
         html += `<div class="detail">第 ${data.iteration} 轮</div>`;
       }
       div.innerHTML = html;
-      append(div);
+      if (beforeEl) {
+        messagesEl.insertBefore(div, beforeEl);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      } else {
+        append(div);
+      }
     }
 
     async function send() {
@@ -252,6 +258,7 @@
       bubble(message, "user");
 
       running = true;
+      assistantEl = null;
       sendBtn.disabled = true;
       statusEl.textContent = "思考中…";
       const spans = indicator();
@@ -317,12 +324,24 @@
           if (cur >= 0 && cur !== idx) spans[cur].classList.remove("active");
           spans[idx].classList.add("active");
         }
-        renderNode(data);
-      } else if (event === "final") {
-        bubble(data.content, "assistant");
-        statusEl.textContent = "完成";
+        renderNode(data, assistantEl);
+      } else if (event === "token") {
+        if (!assistantEl) {
+          assistantEl = document.createElement("div");
+          assistantEl.className = "bubble assistant";
+          append(assistantEl);
+        }
+        assistantEl.textContent += data.content;
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      } else if (event === "done") {
+        statusEl.textContent = "就绪";
       } else if (event === "error") {
-        bubble("❌ " + data.message, "assistant");
+        const message = "❌ " + data.message;
+        if (assistantEl) {
+          assistantEl.textContent += "\n" + message;
+        } else {
+          bubble(message, "assistant");
+        }
       }
     }
 

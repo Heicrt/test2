@@ -1,8 +1,8 @@
 """
 FastAPI + SSE 前端可视化入口（对话交互界面）
 
-复用 `agent_session.stream_updates()` 生成器，
-把每一步 state 变化用 Server-Sent Events (SSE) 逐节点推送给浏览器。
+复用 `agent_session.stream_agent_events()` 生成器，
+把节点 state 变化和最终回复 token 用 Server-Sent Events (SSE) 推送给浏览器。
 
 用法:
     pip install fastapi uvicorn
@@ -20,7 +20,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 # 环境变量由 config.py 在导入 test2.graph 时从项目根目录统一加载
-from test2.agent_session import clear_thread, final_answer, stream_updates
+from test2.agent_session import clear_thread, stream_agent_events
 from test2.runtime import create_runtime
 
 # 本文件所在目录（static 与此同级）
@@ -56,7 +56,7 @@ def get_runtime():
 def get_agent():
     """
     将 Web 全局运行时转换为已编译的 LangGraph app。
-    复用 get_runtime 的懒加载结果，供 stream_updates 执行对话。
+    复用 get_runtime 的懒加载结果，供 stream_agent_events 执行对话。
 
     Returns:
         object: AgentRuntime.app，即已编译的 LangGraph app。
@@ -71,7 +71,7 @@ def sse(event: str, data: dict) -> str:
     生成 event 行、data 行和末尾空行。
 
     Args:
-        event: SSE 事件名，如 "user"、"node"、"final"、"error"。
+        event: SSE 事件名，如 "user"、"node"、"token"、"done"、"error"。
         data: 要发送给前端的结构化数据，会被 JSON 序列化。
 
     Returns:
@@ -134,8 +134,9 @@ async def index():
 async def chat(request: Request):
     """
     将用户聊天请求转换为 SSE 流式响应。
-    解析 message 和 session_id，先返回 user 事件，再通过 stream_updates
-    逐节点推送 node 事件，最后返回 final 和 done；任何异常转为 error 事件。
+    解析 message 和 session_id，先返回 user 事件，再通过 stream_agent_events
+    逐节点推送 node 事件和最终回复 token 事件，最后返回 done；
+    任何异常转为 error 事件。
 
     Args:
         request: FastAPI Request，JSON body 包含 message 和可选 session_id。
@@ -155,24 +156,26 @@ async def chat(request: Request):
     def gen():
         """
         将用户输入和会话 ID 转换为 SSE 事件生成器。
-        先发送 user 事件，再逐个发送 node 事件并收集 updates，
-        最后发送 final 和 done；任何异常发送 error 事件。
+        先发送 user 事件，再逐个发送 node 事件和最终回复 token 事件，
+        最后发送 done；任何异常发送 error 事件。
 
         Returns:
             Iterator[str]: 每次迭代产生一条 SSE 文本帧。
         """
         yield sse("user", {"content": user_input})
-        updates = []
         try:
-            for node_name, update in stream_updates(
+            for event in stream_agent_events(
                 get_agent(),
                 user_input,
                 session_id,
             ):
-                updates.append((node_name, update))
-                yield sse("node", render_node_payload(node_name, update))
-
-            yield sse("final", {"content": final_answer(updates)})
+                kind = event[0]
+                if kind == "node":
+                    _, node_name, update = event
+                    yield sse("node", render_node_payload(node_name, update))
+                elif kind == "token":
+                    _, content = event
+                    yield sse("token", {"content": content})
             yield sse("done", {})
         except Exception as e:
             yield sse("error", {"message": str(e)})

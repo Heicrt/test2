@@ -2,9 +2,9 @@
 
 from collections.abc import Iterable, Iterator
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage
 
-from test2.graph import MAX_ITERATIONS
+from test2.graph import FINAL_ANSWER_TAG, MAX_ITERATIONS
 
 DEFAULT_THREAD_ID = "cli-default"
 
@@ -88,6 +88,92 @@ def stream_updates(
             if update is None:
                 continue
             yield node_name, update
+
+
+def stream_agent_events(
+    app,
+    user_message: str,
+    thread_id: str,
+    recursion_limit: int | None = None,
+) -> Iterator[tuple[str, ...]]:
+    """
+    将用户输入和会话配置提交给 LangGraph app，同时产出节点状态和最终回复 token。
+    使用 stream_mode=["updates", "messages"] 一次获取两类事件；
+    messages token 到达时立即产出，保证 Web 前端逐字显示；
+    工具调用阶段的文本如果模型输出也会显示，工具调用信息仍由 node 事件负责。
+
+    Args:
+        app: 已编译的 LangGraph app，必须支持多 stream mode。
+        user_message: 用户本轮输入文本。
+        thread_id: 会话唯一 ID，用于 checkpointer 恢复历史。
+        recursion_limit: 可选 LangGraph 递归上限，None 时使用 session_config 默认值。
+
+    Returns:
+        Iterator[tuple[str, ...]]:
+            ("node", node_name, update) 表示节点状态更新；
+            ("token", text) 表示最终 AI 回复的一段文本。
+    """
+    tokens_emitted_for_think = False
+
+    for item in app.stream(
+        initial_state(user_message),
+        config=session_config(thread_id, recursion_limit),
+        stream_mode=["updates", "messages"],
+    ):
+        if not isinstance(item, tuple) or len(item) != 2:
+            continue
+
+        mode, data = item
+        if mode == "messages":
+            if (
+                isinstance(data, tuple)
+                and len(data) == 2
+                and isinstance(data[0], AIMessageChunk)
+            ):
+                chunk = data[0]
+                metadata = data[1]
+                if (
+                    FINAL_ANSWER_TAG in metadata.get("tags", [])
+                    and isinstance(chunk.content, str)
+                    and chunk.content
+                ):
+                    tokens_emitted_for_think = True
+                    yield ("token", chunk.content)
+            continue
+
+        if mode != "updates" or not isinstance(data, dict):
+            continue
+
+        for node_name, update in data.items():
+            if update is None:
+                continue
+
+            yield ("node", node_name, update)
+
+            think_tokens_streamed = False
+            if node_name == "think":
+                think_tokens_streamed = tokens_emitted_for_think
+                tokens_emitted_for_think = False
+
+            for msg in update.get("messages", []):
+                if not isinstance(msg, AIMessage):
+                    continue
+
+                if msg.tool_calls:
+                    continue
+
+                content = (
+                    msg.content
+                    if isinstance(msg.content, str)
+                    else str(msg.content)
+                )
+                if not content.strip():
+                    if not think_tokens_streamed:
+                        yield ("token", "（无最终回复）")
+                    continue
+
+                if not think_tokens_streamed:
+                    yield ("token", content)
 
 
 def collect_messages(

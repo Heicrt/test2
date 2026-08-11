@@ -1212,11 +1212,15 @@ StreamingResponse
 ```python
 session_id = str(body.get("session_id") or "default").strip() or "default"
 
-for node_name, update in stream_updates(get_agent(), user_input, session_id):
-    updates.append((node_name, update))
-    yield sse("node", render_node_payload(node_name, update))
+for event in stream_agent_events(get_agent(), user_input, session_id):
+    if event[0] == "node":
+        _, node_name, update = event
+        yield sse("node", render_node_payload(node_name, update))
+    elif event[0] == "token":
+        _, content = event
+        yield sse("token", {"content": content})
 
-yield sse("final", {"content": final_answer(updates)})
+yield sse("done", {})
 ```
 
 ### 8.2 `clear_session(request)`

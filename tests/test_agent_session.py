@@ -1,4 +1,4 @@
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
 from test2.agent_session import (
     DEFAULT_THREAD_ID,
@@ -7,9 +7,10 @@ from test2.agent_session import (
     final_answer,
     initial_state,
     session_config,
+    stream_agent_events,
     stream_updates,
 )
-from test2.graph import MAX_ITERATIONS
+from test2.graph import FINAL_ANSWER_TAG, MAX_ITERATIONS
 
 
 class FakeApp:
@@ -97,6 +98,141 @@ def test_stream_updates_skips_none_node_updates():
     assert updates == [
         ("think", {"messages": []}),
         ("act", {"iteration": 1}),
+    ]
+
+
+def test_stream_agent_events_emits_tokens_immediately():
+    final_id = "final-1"
+    final = AIMessage(content="你好", id=final_id)
+    app = FakeApp(
+        [
+            (
+                "messages",
+                (AIMessageChunk(content="你", id=final_id), {"langgraph_node": "think", "tags": [FINAL_ANSWER_TAG]}),
+            ),
+            (
+                "messages",
+                (AIMessageChunk(content="好", id=final_id), {"langgraph_node": "think", "tags": [FINAL_ANSWER_TAG]}),
+            ),
+            ("updates", {"think": {"messages": [final], "tool_calls": []}}),
+            ("updates", {"extract": None}),
+        ]
+    )
+
+    events = list(stream_agent_events(app, "你好", "thread-1"))
+
+    assert events == [
+        ("token", "你"),
+        ("token", "好"),
+        ("node", "think", {"messages": [final], "tool_calls": []}),
+    ]
+
+
+def test_stream_agent_events_does_not_duplicate_when_chunk_ids_differ():
+    final = AIMessage(content="你好", id="final-msg")
+    app = FakeApp(
+        [
+            (
+                "messages",
+                (AIMessageChunk(content="你", id="chunk-a"), {"langgraph_node": "think", "tags": [FINAL_ANSWER_TAG]}),
+            ),
+            (
+                "messages",
+                (AIMessageChunk(content="好", id="chunk-b"), {"langgraph_node": "think", "tags": [FINAL_ANSWER_TAG]}),
+            ),
+            ("updates", {"think": {"messages": [final], "tool_calls": []}}),
+        ]
+    )
+
+    events = list(stream_agent_events(app, "你好", "thread-1"))
+
+    assert events == [
+        ("token", "你"),
+        ("token", "好"),
+        ("node", "think", {"messages": [final], "tool_calls": []}),
+    ]
+
+
+def test_stream_agent_events_ignores_extract_tokens():
+    app = FakeApp(
+        [
+            (
+                "messages",
+                (
+                    AIMessageChunk(content="记忆提取输出", id="extract-1"),
+                    {"langgraph_node": "extract"},
+                ),
+            ),
+            ("updates", {"extract": None}),
+        ]
+    )
+
+    events = list(stream_agent_events(app, "你好", "thread-1"))
+
+    assert events == []
+
+
+def test_stream_agent_events_streams_tool_call_text_immediately():
+    tool_call = {"name": "calculator", "args": {}, "id": "call-1"}
+    tool_ai = AIMessage(
+        content="",
+        tool_calls=[tool_call],
+        id="call-1",
+    )
+    app = FakeApp(
+        [
+            (
+                "messages",
+                (AIMessageChunk(content="思考中", id="call-1"), {"langgraph_node": "think", "tags": [FINAL_ANSWER_TAG]}),
+            ),
+            (
+                "updates",
+                {"think": {"messages": [tool_ai], "tool_calls": [tool_call]}},
+            ),
+        ]
+    )
+
+    events = list(stream_agent_events(app, "你好", "thread-1"))
+
+    assert events == [
+        ("token", "思考中"),
+        (
+            "node",
+            "think",
+            {"messages": [tool_ai], "tool_calls": [tool_call]},
+        )
+    ]
+
+
+def test_stream_agent_events_falls_back_to_full_content():
+    final = AIMessage(content="直接回答", id="final-2")
+    app = FakeApp(
+        [
+            ("updates", {"think": {"messages": [final]}}),
+        ]
+    )
+
+    events = list(stream_agent_events(app, "你好", "thread-1"))
+
+    assert events == [
+        ("node", "think", {"messages": [final]}),
+        ("token", "直接回答"),
+    ]
+
+
+def test_stream_agent_events_empty_final_content_returns_placeholder():
+    final = AIMessage(content="", id="empty-1")
+    app = FakeApp(
+        [
+            ("updates", {"think": {"messages": [final]}}),
+        ]
+    )
+
+    events = list(stream_agent_events(app, "你好", "thread-1"))
+
+    assert events == [
+        ("node", "think", {"messages": [final]}),
+        ("token", "（无最终回复）"),
     ]
 
 

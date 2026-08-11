@@ -66,7 +66,8 @@ def extract_memory_facts(state, llm, memory_store: MemoryStore) -> dict:
     将当前会话状态和 LLM 提取结果转换为项目级长期记忆的写入操作。
     自动读取当前 config 的 thread_id，构造包含提取指令、会话摘要和最近消息的 prompt，
     调用原始 LLM 获取 JSON，并按 CATEGORIES 逐类调用 merge_facts；
-    任何异常只打印日志并返回空 dict，保留旧记忆、不中断对话。
+    LLM 返回空内容时直接跳过；任何异常只打印日志并返回空 dict，
+    保留旧记忆、不中断对话。
 
     Args:
         state: 当前 ReActState，提供 summary 和 messages 用于构造提取 prompt。
@@ -88,6 +89,9 @@ def extract_memory_facts(state, llm, memory_store: MemoryStore) -> dict:
         prompt.extend(state["messages"])
 
         response = llm.invoke(prompt)
+        if not response.content or not str(response.content).strip():
+            print("[memory] 长期记忆提取跳过：LLM 返回空内容")
+            return {}
         data = parse_memory_json(response.content)
         for category in CATEGORIES:
             facts = data.get(category)

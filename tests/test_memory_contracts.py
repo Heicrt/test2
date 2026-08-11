@@ -1,10 +1,14 @@
+from types import SimpleNamespace
+
 from langchain_core.messages import HumanMessage, SystemMessage
 
+import test2.memory as memory
 from test2.memory import (
     build_long_term_memory_section,
     build_recent_history_section,
     build_summary_section,
     compose_llm_input,
+    extract_memory_facts,
 )
 from test2.memory_contracts import MEMORY_SCOPE, MemoryStore
 
@@ -82,3 +86,25 @@ def test_compose_llm_input_without_sections_keeps_history():
     result = compose_llm_input(FakeMemoryStore(), "", history)
 
     assert result == history
+
+
+def test_extract_memory_facts_skips_empty_response(monkeypatch, capsys):
+    monkeypatch.setattr(
+        memory,
+        "get_config",
+        lambda: {"configurable": {"thread_id": "thread-empty"}},
+    )
+    llm = SimpleNamespace(
+        invoke=lambda prompt: SimpleNamespace(content=None)
+    )
+    store = FakeMemoryStore()
+
+    result = extract_memory_facts(
+        {"summary": "", "messages": []},
+        llm,
+        store,
+    )
+
+    assert result == {}
+    assert store.merged == []
+    assert "空内容" in capsys.readouterr().out
