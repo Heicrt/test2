@@ -137,10 +137,32 @@ _EMPTY_EXTRACTION = object()
 
 
 def _content_preview(content) -> str:
+    """
+    将任意 LLM 响应内容转换为最多 200 字符的诊断预览文本。
+    自动调用 str 转换并截断，用于失败日志中记录响应片段，避免完整内容污染日志。
+
+    Args:
+        content: LLM 返回的 content，可能是 str、None 或可转字符串对象。
+
+    Returns:
+        str: 长度不超过 200 的字符串；空或 None 会变成空字符串。
+    """
     return str(content)[:200]
 
 
 def _validate_content(content):
+    """
+    将 LLM 返回的原始内容转换为符合 MemoryExtraction 的结构化字典。
+    自动跳过空内容、解析 JSON 并执行 Pydantic 校验；解析或校验失败时返回 None，不抛出异常。
+
+    Args:
+        content: LLM 返回的原始内容，可能为空、合法 JSON 或不可解析文本。
+
+    Returns:
+        dict: 校验通过的结构化长期记忆数据。
+        object: 空内容时返回 _EMPTY_EXTRACTION，由调用方识别为跳过。
+        None: 内容存在但无法解析或校验失败。
+    """
     if not content or not str(content).strip():
         return _EMPTY_EXTRACTION
     try:
@@ -151,6 +173,20 @@ def _validate_content(content):
 
 
 def _try_function_calling(llm, prompt, last_content=None):
+    """
+    将提取 prompt 通过强制 Function Calling 转换为 MemoryExtraction 字典。
+    自动绑定 save_long_term_memory 工具并调用 LLM；没有工具调用、参数非法或调用失败时返回 None，
+    并把失败响应前 200 字符记录到 last_content（可选）。
+
+    Args:
+        llm: 支持 bind_tools 的长期记忆提取 LLM。
+        prompt: 包含提取指令、Schema、正例和会话消息的消息列表。
+        last_content: 可选列表，用于收集失败诊断内容；为 None 时不记录。
+
+    Returns:
+        dict: Function Calling 参数校验通过的结构化长期记忆数据。
+        None: 不支持 Function Calling、未返回工具调用或参数校验失败。
+    """
     bind_tools = getattr(llm, "bind_tools", None)
     if bind_tools is None:
         return None
@@ -183,6 +219,21 @@ def _try_function_calling(llm, prompt, last_content=None):
 
 
 def _try_json_mode(llm, prompt, last_content):
+    """
+    将提取 prompt 通过 JSON mode 转换为 MemoryExtraction 字典。
+    自动调用 llm.bind 绑定 response_format=json_object；绑定或调用失败时返回 None，
+    并把响应内容前 200 字符记录到 last_content。
+
+    Args:
+        llm: 支持 bind 的长期记忆提取 LLM。
+        prompt: 包含提取指令、Schema、正例和会话消息的消息列表。
+        last_content: 列表，用于收集失败诊断内容。
+
+    Returns:
+        dict: JSON mode 解析并校验通过的结构化长期记忆数据。
+        object: 空内容时返回 _EMPTY_EXTRACTION。
+        None: JSON mode 不可用或解析校验失败。
+    """
     bind = getattr(llm, "bind", None)
     if bind is None:
         return None
@@ -197,6 +248,21 @@ def _try_json_mode(llm, prompt, last_content):
 
 
 def _try_raw_invoke(llm, prompt, last_content):
+    """
+    将提取 prompt 通过普通 LLM 调用转换为 MemoryExtraction 字典。
+    自动调用 llm.invoke 并解析响应；空内容返回 _EMPTY_EXTRACTION，
+    解析或校验失败返回 None，同时把响应前 200 字符记录到 last_content。
+
+    Args:
+        llm: 长期记忆提取 LLM。
+        prompt: 包含提取指令、Schema、正例和会话消息的消息列表。
+        last_content: 列表，用于收集失败诊断内容。
+
+    Returns:
+        dict: 普通调用解析并校验通过的结构化长期记忆数据。
+        object: 空内容时返回 _EMPTY_EXTRACTION。
+        None: 调用失败或解析校验失败。
+    """
     try:
         response = llm.invoke(prompt)
     except Exception:
