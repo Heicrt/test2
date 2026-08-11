@@ -14,7 +14,17 @@ MAX_FACTS_PER_CATEGORY = 100
 
 
 def _decode_facts_json(raw: str) -> list[str]:
-    """把 facts_json 列解析为事实字符串列表；损坏数据返回空列表。"""
+    """
+    将数据库中的 facts_json 文本解析为事实字符串列表。
+    自动处理损坏 JSON、非 list 根结构和 None 输入，统一返回空列表；
+    list 内元素统一转为字符串，保证调用方拿到稳定 list[str]。
+
+    Args:
+        raw: long_term_memory.facts_json 列内容，可能为损坏文本或非 JSON 数据。
+
+    Returns:
+        list[str]: 解析后的事实列表；损坏或非 list 数据返回空列表。
+    """
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
@@ -25,9 +35,30 @@ def _decode_facts_json(raw: str) -> list[str]:
 
 
 class LongTermMemoryStore:
-    """基于 SQLite 的长期记忆 Store。"""
+    """
+    实现 MemoryStore 的 SQLite 长期记忆存储。
+    负责创建 long_term_memory 表、按 scope/category 合并去重事实、
+    读取可注入 LLM 的记忆文本，并通过 close 释放连接；
+    与 SqliteSaver 共用同一 memory.db 文件，但使用独立 SQLite 连接。
+    """
 
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH):
+        """
+        将数据库路径转换为可用的 LongTermMemoryStore 实例。
+        自动创建父目录、打开 SQLite 连接并设置 Row 工厂，
+        然后初始化 long_term_memory 表；check_same_thread=False 允许多线程访问。
+
+        Args:
+            db_path: SQLite 数据库路径，默认 DEFAULT_DB_PATH；
+                可为 str 或 Path，父目录不存在时会自动创建。
+
+        Returns:
+            None: 无返回值，初始化完成后实例可直接读写长期记忆。
+
+        Raises:
+            OSError: 无法创建数据库文件所在目录时触发。
+            sqlite3.Error: 无法打开或初始化 SQLite 数据库时触发。
+        """
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)  # 数据库文件所在文件夹不存在就创建
         #打开 SQLite 文件；check_same_thread=False 允许多线程访问
@@ -37,7 +68,15 @@ class LongTermMemoryStore:
 
         self._init_schema()
 
-    def _init_schema(self):# 初始化数据库表，_表示私有方法
+    def _init_schema(self):
+        """
+        初始化 long_term_memory 表结构，确保存储可写入。
+        使用 CREATE TABLE IF NOT EXISTS 创建以 (scope, category) 为主键的表
+        并提交事务；重复初始化不会报错。
+
+        Returns:
+            None: 无返回值，建表副作用在数据库文件中持久化。
+        """
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS long_term_memory (
@@ -67,7 +106,21 @@ class LongTermMemoryStore:
         facts: list,
         source_thread_id: str | None = None,
     ):
-        """追加新事实，按精确文本去重，单类最多保留 100 条。"""
+        """
+        将新事实合并写入指定 scope/category 的长期记忆记录。
+        facts 为空时直接返回；否则读取旧事实、按精确文本去重、
+        保留最近 MAX_FACTS_PER_CATEGORY 条，再以 INSERT ... ON CONFLICT DO UPDATE
+        写回并提交事务。
+
+        Args:
+            scope: 记忆作用域，决定写入哪一组长期记忆。
+            category: 事实类别，来自 CATEGORIES 固定集合。
+            facts: 本次新增事实列表；空列表表示不需要写入。
+            source_thread_id: 可选来源会话 ID，仅记录事实来源，不参与去重。
+
+        Returns:
+            None: 无返回值，写入结果通过后续 get_facts 或 get_memory_context 读取。
+        """
         if not facts:
             return
 
@@ -108,6 +161,18 @@ class LongTermMemoryStore:
         self.conn.commit()
 
     def get_facts(self, scope: str, category: str) -> list[str]:
+        """
+        将指定 scope/category 的 facts_json 读取为事实字符串列表。
+        无记录时返回空列表；记录存在时使用 _decode_facts_json 统一解析，
+        损坏数据返回空列表而不抛出异常。
+
+        Args:
+            scope: 记忆作用域，与写入时一致。
+            category: 事实类别，与写入时一致。
+
+        Returns:
+            list[str]: 该类别下的事实列表；无记录或数据损坏时为空列表。
+        """
         row = self.conn.execute(
             """
             SELECT facts_json
@@ -122,7 +187,17 @@ class LongTermMemoryStore:
         return _decode_facts_json(row["facts_json"])
 
     def get_memory_context(self, scope: str = MEMORY_SCOPE) -> str:
-        """返回按类别组织好的长期记忆文本。"""
+        """
+        将指定 scope 下全部长期记忆转换为按类别组织的文本。
+        一次查询 category 和 facts_json 并按 category 排序，
+        跳过空类别和损坏 JSON；输出格式适合直接放入 SystemMessage。
+
+        Args:
+            scope: 记忆作用域，默认项目级 MEMORY_SCOPE。
+
+        Returns:
+            str: 按类别组织的长期记忆文本；无记忆时返回空字符串。
+        """
         rows = self.conn.execute(
             """
             SELECT category, facts_json
@@ -142,6 +217,17 @@ class LongTermMemoryStore:
         return "\n\n".join(parts)
 
     def clear_scope(self, scope: str = MEMORY_SCOPE):
+        """
+        删除指定 scope 下的全部长期记忆记录。
+        执行 DELETE 并提交事务；只影响 long_term_memory，
+        不删除 checkpointer 保存的会话数据。
+
+        Args:
+            scope: 要清空的记忆作用域，默认项目级 MEMORY_SCOPE。
+
+        Returns:
+            None: 无返回值，清空结果通过后续 get_memory_context 读取。
+        """
         self.conn.execute(
             "DELETE FROM long_term_memory WHERE scope = ?",
             (scope,),
@@ -149,8 +235,22 @@ class LongTermMemoryStore:
         self.conn.commit()
 
     def close(self):
+        """
+        关闭 LongTermMemoryStore 持有的 SQLite 连接。
+        关闭后当前实例不应继续读写；重复关闭由 sqlite3 自行处理。
+
+        Returns:
+            None: 无返回值，资源释放结果通过后续连接状态体现。
+        """
         self.conn.close()
 
     @staticmethod
     def _now() -> str:
+        """
+        生成当前 UTC 时间的 ISO 8601 字符串。
+        使用 timezone.utc 保证 updated_at 时间统一、可排序。
+
+        Returns:
+            str: 形如 2026-08-11T00:00:00+00:00 的当前 UTC 时间字符串。
+        """
         return datetime.now(timezone.utc).isoformat()

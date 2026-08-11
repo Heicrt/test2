@@ -35,6 +35,17 @@ _runtime = None
 
 
 def get_runtime():
+    """
+    将 provider 配置转换为全局复用的 AgentRuntime 实例。
+    首次调用时读取 LLM_PROVIDER 并调用 create_runtime，
+    后续复用模块级 _runtime；保证页面打开不触发 LLM 初始化。
+
+    Returns:
+        AgentRuntime: 已包含 app、checkpointer 和 memory_store 的运行时。
+
+    Raises:
+        ValueError: 首次创建时 provider 缺失、未知或 protocol 不支持时触发。
+    """
     global _runtime
     if _runtime is None:
         provider = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
@@ -43,11 +54,29 @@ def get_runtime():
 
 
 def get_agent():
+    """
+    将 Web 全局运行时转换为已编译的 LangGraph app。
+    复用 get_runtime 的懒加载结果，供 stream_updates 执行对话。
+
+    Returns:
+        object: AgentRuntime.app，即已编译的 LangGraph app。
+    """
     return get_runtime().app
 
 
 def sse(event: str, data: dict) -> str:
-    """打包一条 SSE 事件"""
+    """
+    将事件名和数据字典打包为一条 SSE 文本帧。
+    自动使用 ensure_ascii=False 和 default=str 序列化 data，
+    生成 event 行、data 行和末尾空行。
+
+    Args:
+        event: SSE 事件名，如 "user"、"node"、"final"、"error"。
+        data: 要发送给前端的结构化数据，会被 JSON 序列化。
+
+    Returns:
+        str: 可直接写入 StreamingResponse 的 SSE 文本帧。
+    """
     return (
         f"event: {event}\n"
         f"data: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
@@ -56,10 +85,17 @@ def sse(event: str, data: dict) -> str:
 
 def render_node_payload(node: str, update: dict) -> dict:
     """
-    把单个节点的 state 更新，整理成前端好渲染的扁平结构。
+    将单个节点的状态更新转换为前端友好的扁平 JSON 结构。
+    自动把 messages 中的 LangChain 对象提取为 type/content/tool_calls
+    纯文本结构，并带上 thought、should_act、tool_calls、iteration，
+    避免前端依赖 LangChain 对象结构。
 
-    - 把 messages 里的消息提取成纯文本列表（避免前端依赖 LangChain 对象结构）
-    - 保留 iteration / should_act / tool_calls 供前端展示
+    Args:
+        node: 节点名称，如 "think"、"act"、"observe"。
+        update: stream_updates 产出的单节点状态更新 dict。
+
+    Returns:
+        dict: 包含 node、messages、thought、should_act、tool_calls、iteration 的 JSON 对象。
     """
     messages = []
     for msg in update.get("messages", []):
@@ -83,12 +119,30 @@ def render_node_payload(node: str, update: dict) -> dict:
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
+    """
+    将 static/index.html 内容读取为 FastAPI HTMLResponse。
+    直接读取 STATIC_DIR 下的页面文件并返回，页面本身不触发 Agent 初始化。
+
+    Returns:
+        HTMLResponse: Web 可视化页面 HTML。
+    """
     with open(os.path.join(STATIC_DIR, "index.html"), encoding="utf-8") as f:
         return HTMLResponse(f.read())
 
 
 @app.post("/api/chat")
 async def chat(request: Request):
+    """
+    将用户聊天请求转换为 SSE 流式响应。
+    解析 message 和 session_id，先返回 user 事件，再通过 stream_updates
+    逐节点推送 node 事件，最后返回 final 和 done；任何异常转为 error 事件。
+
+    Args:
+        request: FastAPI Request，JSON body 包含 message 和可选 session_id。
+
+    Returns:
+        StreamingResponse: media_type 为 text/event-stream 的 SSE 响应。
+    """
     body = await request.json()
     user_input = body.get("message", "").strip()
     session_id = str(body.get("session_id") or "default").strip() or "default"
@@ -99,6 +153,14 @@ async def chat(request: Request):
         )
 
     def gen():
+        """
+        将用户输入和会话 ID 转换为 SSE 事件生成器。
+        先发送 user 事件，再逐个发送 node 事件并收集 updates，
+        最后发送 final 和 done；任何异常发送 error 事件。
+
+        Returns:
+            Iterator[str]: 每次迭代产生一条 SSE 文本帧。
+        """
         yield sse("user", {"content": user_input})
         updates = []
         try:
@@ -120,6 +182,17 @@ async def chat(request: Request):
 
 @app.post("/api/clear")
 async def clear_session(request: Request):
+    """
+    将会话清空请求转换为 checkpointer 删除操作。
+    解析 session_id 并调用 clear_thread，成功后返回 ok=True；
+    只清空当前会话，不影响项目级长期记忆。
+
+    Args:
+        request: FastAPI Request，JSON body 包含可选 session_id。
+
+    Returns:
+        dict: 包含 ok=True 的清理结果。
+    """
     body = await request.json()
     session_id = str(body.get("session_id") or "default").strip() or "default"
     clear_thread(get_runtime(), session_id)

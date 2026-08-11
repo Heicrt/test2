@@ -40,14 +40,23 @@ with open(PRESETS_PATH, "rb") as f:
 
 def get_llm(provider: str | None = None, temperature: float | None = None):
     """
-    获取 LLM 实例
+    将供应商名称和可选温度参数解析为 LangChain ChatModel 实例。
+    内部自动从环境变量补齐 provider、model、api_key 和 temperature 等配置，
+    再按 providers.toml 中的 protocol 选择 ChatAnthropic 或 ChatOpenAI；
+    配置缺失、供应商未知或协议不支持时直接抛出 ValueError，不返回降级模型。
 
     Args:
-        provider: 供应商名称，不传则读 .env 中的 LLM_PROVIDER
-        temperature: 温度参数，不传则读 .env 中的 LLM_TEMPERATURE
+        provider: 供应商名称，通常来自 .env 的 LLM_PROVIDER；
+            可为 None 或空字符串，此时自动读取环境变量并统一转为小写。
+        temperature: 模型采样温度；不传时读取 .env 的 LLM_TEMPERATURE，
+            缺省值为 0。
 
     Returns:
-        LangChain ChatModel 实例
+        LangChain ChatModel: 可执行 invoke 和 bind_tools 的模型实例。
+
+    Raises:
+        ValueError: provider 为空、provider 不在 providers.toml、
+            protocol 不支持，或 LLM_TEMPERATURE 不是合法数字时触发。
     """
     # 从环境变量读取
     provider = (provider or os.getenv("LLM_PROVIDER", "")).strip().lower()

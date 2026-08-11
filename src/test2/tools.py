@@ -12,10 +12,17 @@ from langchain_core.tools import tool
 
 @tool
 def calculator(expression: str) -> str:
-    """计算数学表达式。
+    """
+    将数学表达式字符串计算为结果字符串。
+    在禁用 __builtins__ 的安全命名空间内解析表达式，仅允许预置数学函数和常量；
+    任何计算异常都转换为“计算错误: ...”文本返回，不向调用方抛出。
 
-    支持: +, -, *, /, **, sqrt, sin, cos, tan, log, pi, e
-    示例: "2 + 3 * 4", "sqrt(16)", "sin(pi/2)", "2**10"
+    Args:
+        expression: 用户或 LLM 提供的数学表达式字符串，
+            支持 + - * / ** 以及 sqrt、sin、cos、tan、log、pi、e 等预置符号。
+
+    Returns:
+        str: 计算结果字符串；计算失败时返回以“计算错误: ”开头的错误信息。
     """
     # 安全的数学环境，禁止任意代码执行
     safe_ns = {
@@ -41,10 +48,17 @@ def calculator(expression: str) -> str:
 
 @tool
 def weather(city: str) -> str:
-    """查询指定城市的当前实时天气（调用和风天气 API）。
+    """
+    将城市名称转换为该城市当前实时天气描述字符串。
+    自动读取 QWEATHER 配置，先通过和风天气城市搜索接口将中文城市名转为 LocationID，
+    再请求实时天气；配置缺失、网络失败、API 错误或数据解析失败都返回错误文本，不抛出异常。
 
     Args:
-        city: 城市名称，如 "北京"、"上海"、"深圳"
+        city: 城市名称字符串，如 "北京"、"上海"、"深圳"。
+
+    Returns:
+        str: 包含城市、天气、气温、体感、湿度和风向等级的天气描述；
+            查询失败时返回对应的错误说明文本。
     """
     api_host = os.getenv("QWEATHER_API_HOST")
     api_key = os.getenv("QWEATHER_API_KEY")

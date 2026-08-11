@@ -24,7 +24,18 @@ THREAD_ID = DEFAULT_THREAD_ID
 
 
 def print_react_log(messages, iteration):
-    """打印 ReAct 过程日志（Think → Act → Observe）"""
+    """
+    将消息列表和循环轮数转换为控制台 ReAct 过程日志。
+    打印标题后遍历消息，识别带 tool_calls 的 AIMessage 和 ToolMessage，
+    分别输出 Think、Act、Observe 摘要；当前调用处已注释，保留为可选日志函数。
+
+    Args:
+        messages: LangChain 消息列表，通常由 collect_messages 汇总。
+        iteration: 已完成的工具循环轮数，来自 observe 节点计数。
+
+    Returns:
+        None: 无返回值，日志直接写入控制台。
+    """
     print(f"\n{'='*50}")
     print(f"  ReAct 循环完成：共 {iteration} 轮")
     print(f"{'='*50}")
@@ -44,7 +55,17 @@ def print_react_log(messages, iteration):
 
 
 def print_state_changes(updates):
-    """打印每一步 state 变化（stream_mode="updates" 捕获的记录）"""
+    """
+    将扁平化节点更新流转换为控制台状态变化日志。
+    逐个输出 node_name 和 update 字段；messages 字段拆成消息类名和内容，
+    tool_calls 附工具调用信息，其他字段直接打印。
+
+    Args:
+        updates: stream_updates 产出的 (node_name, update) 列表。
+
+    Returns:
+        None: 无返回值，日志直接写入控制台。
+    """
     for i, (node_name, update) in enumerate(updates, 1):
         print(f"\n─── 第 {i} 步 · {node_name} 节点 ───")
         for key, value in update.items():
@@ -59,6 +80,16 @@ def print_state_changes(updates):
 
 
 def main():
+    """
+    启动 ReAct Agent CLI 交互主循环。
+    读取 provider/model，创建 runtime，进入 stdin 交互；
+    支持 quit/exit/q 退出和 clear//clear 清空会话，
+    每次输入运行 stream_updates 并打印最终回复和状态变化；
+    初始化或运行异常时输出友好错误。
+
+    Returns:
+        None: 无返回值，程序退出由退出命令或 EOF/KeyboardInterrupt 触发。
+    """
     # 读取 provider：从 .env 环境变量
     provider = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
 
